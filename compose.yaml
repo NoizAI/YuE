@@ -2,13 +2,24 @@ services:
   yue2:
     build: .
     # One process per GPU. Do not scale onto the same GPU/data volume.
-    gpus: all
+    cpus: ${YUE2_CPUS:-4}
+    mem_limit: ${YUE2_MEMORY_LIMIT:-48g}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${YUE2_GPU_DEVICE:-0}"]
+              capabilities: [gpu]
     init: true
     restart: unless-stopped
     stop_grace_period: 2m
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${YUE2_PORT:-8000}:8000"
     environment:
+      OMP_NUM_THREADS: "4"
+      MKL_NUM_THREADS: "4"
+      OPENBLAS_NUM_THREADS: "4"
       YUE2_API_KEY: ${YUE2_API_KEY:?Set YUE2_API_KEY in .env}
       YUE2_DEVICE: cuda
       YUE2_BACKEND: ${YUE2_BACKEND:-torch}

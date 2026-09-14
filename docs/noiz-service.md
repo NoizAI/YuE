@@ -1,13 +1,13 @@
 # Noiz YuE2 服务与 5090 推理优化
 
 此分支增加 FastAPI 异步服务和显存常驻优化。部署目标：Linux、标准 RTX 5090 32 GB、
-Python 3.12、PyTorch 2.10.0 CUDA 12.8 构建。真实 GPU 测试完成前不承诺耗时或加速比例。
+通用镜像使用 Python 3.12、PyTorch 2.10.0 CUDA 12.8。ucloud-4 已在独立 Python 3.11 环境完成真实 GPU 验证，见下文实测。
 这是单机、单 GPU、单租户服务：持有 API 密钥的调用方可读取本服务中的全部任务。
 
 ## 在 5090 上运行
 
 先安装支持 5090 的 NVIDIA 驱动，确认 `nvidia-smi` 正常。
-Docker 路径还需要 Docker Compose（支持 `gpus`）与 NVIDIA Container Toolkit。
+Docker 路径还需要 Docker Compose 与 NVIDIA Container Toolkit。
 
 ```bash
 git clone https://github.com/NoizAI/YuE.git
@@ -15,6 +15,8 @@ cd YuE
 git switch codex/fastapi-inference-acceleration
 cp .env.example .env
 # 编辑 .env：用 openssl rand -hex 32 的结果替换 YUE2_API_KEY。
+# YUE2_GPU_DEVICE 指定空闲 GPU 的 UUID（nvidia-smi -L 查看），默认 GPU 0。
+# YUE2_PORT 可换空闲端口；默认限制 4 CPU / 48 GiB 内存。
 docker compose up --build -d
 docker compose logs -f yue2
 curl -i http://127.0.0.1:8000/health/ready
@@ -111,9 +113,10 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 真实 GPU 对比
 
-停止占同一 GPU 的其他服务，在主机虚拟环境中运行：
+选择空闲且专供本次测试的 GPU，在主机虚拟环境中运行：
 
 ```bash
+export CUDA_VISIBLE_DEVICES=替换为空闲GPU的UUID
 yue2-benchmark --check
 yue2-benchmark --requests examples/benchmark-requests.jsonl \
   --profiles reference resident --warmup 1 --repeats 3 \
@@ -142,3 +145,25 @@ python -m pytest -q
 
 接口测试使用模拟模型；常驻模式测试使用真实小型 VAE 检查输出一致和解码中断。
 完整模型与 CUDA 专项测试需要 GPU。代码沿用 Apache 2.0；权重仍受 CC BY-NC 4.0 约束。
+
+## 2026-09-14：ucloud-4 GPU 5 实测
+
+服务地址：服务器本机 `http://127.0.0.1:8015`，容器 `noiz-yue-gpu5`。
+部署目录 `/data/noiz-yue`，具体操作见 [部署说明](../deploy/ucloud4/README.md)。
+Docker Hub 不可达，因此使用服务器已有镜像的固定 SHA256 作为只读基础，挂载独立虚拟环境；
+本次没有完成根目录 Dockerfile 的完整构建验证。
+
+固定 32 步、BF16，单 GPU、4 CPU 限额；两条原创新歌词，每个模式两次正式生成，另各预热一次：
+
+- 69.96 秒中文歌曲：reference 平均 20.94 秒，resident 平均 16.69 秒，耗时减少 20.3%。
+- 242.24 秒英文歌曲：reference 平均 66.17 秒，resident 平均 61.88 秒，耗时减少 6.5%。
+- 四组配对的音频、前缀、语义 token、声学 latent 文件 SHA-256 均相同；八次正式生成均完整成功。
+- resident 的 PyTorch 已分配显存峰值约 9.61 GiB；这不是整卡 NVML 显存峰值。
+- 真实 HTTP 测试成功生成同一条中文歌曲；提交到轮询发现完成约 18.1 秒（包含保存与最多 2 秒轮询间隔）。
+  鉴权 401、幂等提交、排队取消、FLAC 和 ABC 下载均通过。
+- GPU 测试：209 passed、2 skipped、30 subtests passed。跳过可选 vLLM 与未安装的原始发布包对照。
+- 原有七个 worker 的 PID 和启动时间在测试前后完全一致。所有新增 GPU 工作只用指定 GPU 5。
+
+原始数字见 [实测数据](benchmarks/ucloud4-5090.json)。这是两条样本的测量，不是生产流量的 p95 或所有歌曲的保证。
+完整测试记录与可试听音频保存在本次交付目录 `/Users/jishenwei/workFile/2026/0914yue2`。
+常驻优化每首主要减少约 4 秒模型搬运开销，所以短歌曲的相对收益更明显。
