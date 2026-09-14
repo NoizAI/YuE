@@ -121,7 +121,13 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 resident_models=False):
+        if not isinstance(resident_models, bool):
+            raise TypeError("resident_models must be True or False")
+        if resident_models and (backend == "vllm" or offload_ar):
+            raise ValueError("resident_models requires a torch backend and offload_ar=False")
+        self.resident_models = resident_models
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -311,18 +317,33 @@ class YuE2Pipeline:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+    def preload(self):
+        """Load reusable weights before accepting traffic (CUDA graphs warm per shape)."""
+        from .modeling_vae import YuE2VAE
+        if self.backend != "vllm":
+            self._load_model()
+        if self._vae is None:
+            self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True,
+                                              device="cpu", local_files_only=True)
+        if self.resident_models:
+            self._vae.to(self.device)
+        synchronize(self.device)
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
 
-    def decode(self, latents, *, full=False, vae=None):
+    def decode(self, latents, *, full=False, vae=None, cancelled=None):
         from .modeling_vae import YuE2VAE
+        resident = getattr(self, "resident_models", False)
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Cancelled before audio decode")
         with self._status("Loading audio decoder"):
-            if self._model is not None:
+            if self._model is not None and not resident:
                 self._model.to("cpu")
-            if self.device.type == "cuda":
+            if self.device.type == "cuda" and not resident:
                 torch.cuda.empty_cache()
             if vae is not None:
                 model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=self.device)
@@ -339,7 +360,13 @@ class YuE2Pipeline:
         try:
             tiles = 1 if full else (z.shape[-1] + self.vae_core_frames - 1) // self.vae_core_frames
             with self._status("Decoding audio", total=tiles, unit="chunks") as status:
-                report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
+                report = None
+                if self.progress or cancelled is not None:
+                    def report(completed, total):
+                        if cancelled is not None and cancelled():
+                            raise InterruptedError("Cancelled during audio decode")
+                        if self.progress:
+                            status.update(completed, total=total)
                 with torch.inference_mode():
                     if full:
                         audio = model.decode(z.to(self.device)).cpu()
@@ -351,8 +378,9 @@ class YuE2Pipeline:
                     raise ValueError("VAE produced non-finite audio")
                 return audio[0].float().clamp(-1, 1).T.contiguous().numpy()
         finally:
-            model.to("cpu")
-            if self.device.type == "cuda":
+            if not resident or vae is not None:
+                model.to("cpu")
+            if self.device.type == "cuda" and not resident:
                 torch.cuda.empty_cache()
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
@@ -371,25 +399,34 @@ class YuE2Pipeline:
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
                 "vae_core_frames": self.vae_core_frames, "vae_halo_frames": 16,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
-                "offload_ar": self.offload_ar, "runtime_sha256": self.runtime_sha256,
+                "offload_ar": self.offload_ar, "resident_models": getattr(self, "resident_models", False),
+                "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text()).get("release_variant"),
                 "validation_status": "unvalidated"}
 
     def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
-                 semantic_sampling=None, cancelled=None, on_token=None, **kwargs):
+                 semantic_sampling=None, cancelled=None, on_token=None, on_stage=None, **kwargs):
         request = self._request(style, lyrics, tags=tags, **kwargs)
         config = self.effective_config(request, abc_sampling, semantic_sampling)
         request_id = identity({"request": request.to_dict(), "config": config, "weights": self.weights})
         start = time.perf_counter()
+        if on_stage is not None:
+            on_stage("planning")
         plan = self.plan(request=request, abc_sampling=abc_sampling, cancelled=cancelled, on_token=on_token)
+        if on_stage is not None:
+            on_stage("semantic")
         semantic = self.generate_semantic(plan, sampling=semantic_sampling, cancelled=cancelled, on_token=on_token)
+        if on_stage is not None:
+            on_stage("synthesis")
         nar_start = time.perf_counter()
         latents = self.synthesize(semantic, cancelled=cancelled)
         nar_seconds = time.perf_counter() - nar_start
         if cancelled is not None and cancelled():
             raise InterruptedError("Cancelled before VAE")
         vae_start = time.perf_counter()
-        audio = self.decode(latents)
+        if on_stage is not None:
+            on_stage("decode")
+        audio = self.decode(latents, cancelled=cancelled) if cancelled is not None else self.decode(latents)
         timing = {"abc": plan.timing, "semantic": semantic.timing, "nar_seconds": nar_seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
                   "e2e_seconds": time.perf_counter() - start}

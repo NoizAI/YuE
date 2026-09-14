@@ -1,3 +1,6 @@
+> **NoizAI customization:** [FastAPI service, RTX 5090 deployment and inference benchmarks](docs/noiz-service.md).
+> Branch: `codex/fastapi-inference-acceleration`. Adds a durable job API and optional GPU model residency; GPU speedup is pending measurement.
+
 > Looking for the original YuE? Its code, documentation, and license are preserved on the **[YuE-v1 branch](https://github.com/multimodal-art-projection/YuE/tree/YuE-v1)**.
 
 <p align="center">
