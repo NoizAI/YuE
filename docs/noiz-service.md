@@ -30,11 +30,10 @@ curl -i http://127.0.0.1:8000/health/ready
 也可以直接在 Linux 主机安装：
 
 ```bash
-python3.12 -m venv .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install '.[server]'
+uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install '.[server]'
 export YUE2_API_KEY="$(openssl rand -hex 32)"
 export YUE2_DATA_DIR="$PWD/outputs/service"
 yue2-serve
@@ -85,7 +84,7 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 运维与恢复
 
-- 一个后台线程独占模型，HTTP 并发不等于 GPU 并发。
+- 一个服务进程独占 GPU；兼容请求的 AR 阶段可由 vLLM 并行，NAR/VAE 仍串行。
 - SQLite 保存任务和幂等键；重启继续 queued 任务，原 running 标记 `worker_interrupted`。
 - 同一数据目录使用进程锁，禁止多 Uvicorn worker。多 GPU 使用不同 CUDA_VISIBLE_DEVICES、端口和数据目录。
 - 推理异常会记录服务端日志并重建模型；HTTP 不暴露原始异常中的内部路径。
@@ -94,22 +93,33 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 加速配置
 
-默认服务：`torch + resident_models=true + BF16 + 32 步`。
-上游每次解码前把主模型移到 CPU，结束再把 VAE 移回 CPU；常驻模式使两者留在 GPU 复用，
-减少模型搬运和缓存清理。不减少歌词、token 预算或合成步数。
-上游原有 CUDA Graph / FlashAttention 仍保留，不计作本分支新增优化。
+默认服务：`vLLM AR + max_num_seqs=4 + AR concurrency=4 + BF16 + 32 步`。
+vLLM 只执行乐谱和 semantic token 两个 AR 阶段；NAR 声学生成和 VAE 解码仍使用 PyTorch。
+服务启动时加载一次 vLLM 引擎，并保持到服务退出，不再在每首歌进入 NAR 时销毁。
+队列会一次认领最多 `YUE2_AR_CONCURRENCY` 个兼容请求，并发提交给同一个 vLLM 调度器；
+这些请求完成 AR 后再串行执行 NAR/VAE，避免并发声学阶段争抢显存。
 
-服务启动预加载和短预热，将初始化移出正式任务；短预热不覆盖所有形状，上游仍会按生成创建 CUDA Graph。
-`YUE2_WARMUP=false` 跳过短预热，预加载保留。
-显存不足时设 `YUE2_RESIDENT_MODELS=false` 恢复原策略再测。
-`YUE2_MEMORY_BUDGET_GIB=30` 针对 32 GB 卡，内部分配器还会预留余量；其他显存版本需调整。
+默认并行参数针对当前 32 GB RTX 5090 设置为 4。`YUE2_VLLM_MAX_NUM_SEQS` 控制引擎容量，
+`YUE2_AR_CONCURRENCY` 控制服务同时提交的 AR 请求，后者不能大于前者。提高这两个值会线性增加
+KV 需求；4 路满 24576 上下文理论上约需 10.5 GiB KV。
+`YUE2_AR_BATCH_WAIT_MS=50` 给同时到达的请求一个很短的合批窗口；低延迟优先时可调低，
+吞吐优先时可在压测后适当调高。
+
+服务启动预加载 vLLM、VAE 和短预热，将初始化移出正式任务。
+`YUE2_WARMUP=false` 跳过短预热，但保留 vLLM 引擎预加载。
+vLLM 模式必须保持 `YUE2_RESIDENT_MODELS=false`；完整 PyTorch MoT 模型只在 NAR 阶段使用，
+与常驻 vLLM AR 权重共享同一张卡。`YUE2_VLLM_GPU_MEMORY_UTILIZATION=0.25` 将 vLLM 执行器
+限制在整卡约 25% 的显存目标内，不再固定预分配满上下文 KV。因为 8 GiB 低于 4 路满上下文
+权重加 KV 的理论需求，长请求可能被 vLLM 抢占或重计算；该设置必须以真实并发压测为准。
 
 实验选项需要压测、试听后启用：
 
 - `YUE2_ODE_STEPS=16`：减少合成迭代，可能影响音质；只加速合成阶段，不代表整首快一倍。
-- `YUE2_QUANTIZATION=fp8`：上游实验实现，会退出当前 CUDA Graph 路径，可能更慢；默认关闭。
-- `YUE2_BACKEND=vllm`：需另装 `.[fast]` 并关闭 resident_models。当前适配器仅单请求，合成时还会关闭
-  vLLM 引擎，部分 CFG 设置会回退 torch。基础 Docker 镜像不预装这个可选依赖。
+- `YUE2_QUANTIZATION=fp8`：仅支持 torch 后端，会退出 CUDA Graph 路径，可能更慢；默认关闭。
+- `YUE2_BACKEND=torch`：回退到单请求 CUDA Graph，可与 `YUE2_RESIDENT_MODELS=true` 配合。
+
+`cot=off` 或显式 `cfg_scale != 1` 仍会回退 torch AR，以保留历史 CFG/采样语义；这类请求不进入
+并行 vLLM 批次。默认 full/melody、默认 CFG=1 的请求使用并行 vLLM AR。
 
 ## 真实 GPU 对比
 

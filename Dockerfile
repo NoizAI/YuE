@@ -1,8 +1,9 @@
 # Linux/amd64 + CUDA 12.8 for RTX 5090. Weights use a mounted cache.
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+COPY --from=ghcr.io/astral-sh/uv:0.8.22 /uv /usr/local/bin/uv
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_NO_CACHE=1 \
     PATH=/opt/venv/bin:$PATH \
     HF_HOME=/data/huggingface \
     YUE2_DATA_DIR=/data/jobs \
@@ -14,9 +15,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m venv /opt/venv
 WORKDIR /app
 COPY . /app
-RUN python -m pip install --upgrade pip \
-    && python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 \
-    && python -m pip install '.[server]'
+RUN uv pip install --python /opt/venv/bin/python \
+        torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 \
+    && uv pip install --python /opt/venv/bin/python '.[server]'
 # Named volumes inherit ownership on first use; bind mounts need matching permissions.
 RUN useradd --uid 10001 --create-home yue2 && mkdir -p /data/huggingface /data/jobs \
     && chown -R yue2:yue2 /data

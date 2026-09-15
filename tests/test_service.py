@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from yue2.service import GenerateRequest, Settings, create_app
+from yue2.service import GenerateRequest, JobWorker, Settings, create_app
 from yue2.service_store import JobStore, QueueFull
 
 KEY = "test-only-api-key-123456789"
@@ -255,6 +255,61 @@ def test_store_atomic_capacity_under_parallel_submissions(tmp_path):
         assert sum(pool.map(submit_one, range(20))) == 3
 
 
+def test_claim_many_is_atomic_and_ordered(tmp_path):
+    store = JobStore(tmp_path / "jobs.db")
+    jobs = [store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in (4, 3, 2)]
+    claimed = store.claim_many(2)
+    assert [job["id"] for job, _ in claimed] == [jobs[0]["id"], jobs[1]["id"]]
+    assert all(store.get(job["id"])["status"] == "running" for job, _ in claimed)
+    assert store.get(jobs[2]["id"])["status"] == "queued"
+
+
+def test_worker_batches_vllm_ar_and_serializes_render(tmp_path):
+    class ParallelPipeline:
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.ar_active = self.ar_peak = self.render_active = self.render_peak = 0
+
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, on_stage, on_token, **kwargs):
+            on_stage("planning")
+            with self.lock:
+                self.ar_active += 1
+                self.ar_peak = max(self.ar_peak, self.ar_active)
+            self.barrier.wait(timeout=2)
+            on_token("abc", seed)
+            with self.lock:
+                self.ar_active -= 1
+            return seed
+
+        def render_ar(self, seed, *, on_stage, **kwargs):
+            on_stage("synthesis")
+            with self.lock:
+                self.render_active += 1
+                self.render_peak = max(self.render_peak, self.render_active)
+            time.sleep(.01)
+            with self.lock:
+                self.render_active -= 1
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={"backend": "vllm"}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
+                        vllm_max_num_seqs=2)
+    pipe = ParallelPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    submitted = [worker.store.submit({**REQUEST, "seed": seed}, 2)[0] for seed in (41, 42)]
+    assert worker._execute_claimed(worker.store.claim_many(2)) is False
+    assert pipe.ar_peak == 2 and pipe.render_peak == 1
+    assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
+
+
 def test_cancel_racing_success_cannot_publish_result(tmp_path):
     store = JobStore(tmp_path / "jobs.db")
     job, _ = store.submit(REQUEST, 1)
@@ -271,6 +326,11 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     monkeypatch.setenv("YUE2_BACKEND", "vllm")
     settings = Settings.from_env()
     assert not settings.resident_models and settings.backend == "vllm"
+    assert settings.ar_concurrency == settings.vllm_max_num_seqs == 4
+    assert settings.vllm_gpu_memory_utilization == .25
+    assert settings.ar_batch_wait_ms == 50
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, backend="vllm", resident_models=True)
+    with pytest.raises(ValidationError):
+        Settings(api_key=KEY, vllm_gpu_memory_utilization=1)

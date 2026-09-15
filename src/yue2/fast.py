@@ -1,19 +1,18 @@
 """Optional vLLM AR worker; base imports never require vLLM or Triton.
 
 The standard Qwen3 AR subset is derived from the full MoT checkpoint into a
-content-addressed cache. A separate process retains its engine between ABC
-and semantic generation. close_vllm() releases the complete GPU process group
-before NAR/VAE. The public pipeline currently submits one request at a time.
+content-addressed cache. A separate process retains its engine for the service
+lifetime and multiplexes concurrent ABC/semantic requests. NAR/VAE remain in
+the parent PyTorch process; close_vllm() is only used at pipeline shutdown.
 """
 import contextlib
 import dataclasses
-import gc
 import importlib.util
 import json
 import math
 import os
 from pathlib import Path
-import selectors
+import queue
 import signal
 import subprocess
 import sys
@@ -223,7 +222,11 @@ def _stop_process(process):
 
 class _Worker:
     def __init__(self, pipe):
-        self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.state_lock = threading.Lock()
+        self.pending = {}
+        self.ready = queue.Queue(maxsize=1)
+        self.closed = False
         self.temp = tempfile.TemporaryDirectory(prefix="yue2-vllm-")
         self.log_path = Path(self.temp.name) / "worker.log"
         self.log = self.log_path.open("w+")
@@ -233,57 +236,127 @@ class _Worker:
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                          bufsize=0, env=env, start_new_session=True)
         self.finalizer = weakref.finalize(self, _stop_process, self.process)
-        self.selector = selectors.DefaultSelector()
-        self.selector.register(self.process.stdout, selectors.EVENT_READ)
-        self.buffer = b""
+        self.reader = threading.Thread(target=self._read, name="yue2-vllm-events", daemon=True)
+        self.reader.start()
         self._send({"model_dir": str(pipe.model_dir), "device": str(pipe.device),
-                    "memory_budget_gib": pipe.memory_budget_gib})
+                    "gpu_memory_utilization": getattr(
+                        pipe, "vllm_gpu_memory_utilization", .25),
+                    "max_num_seqs": getattr(pipe, "vllm_max_num_seqs", 1)})
+        try:
+            event = self.ready.get(timeout=1200)
+        except queue.Empty:
+            self.close()
+            raise TimeoutError("Timed out starting the vLLM AR engine") from None
+        if event.get("error"):
+            details = self._details()
+            self.close()
+            raise RuntimeError(f"vLLM worker failed during startup: {event['error']}\n{details}")
 
     def _send(self, value):
-        self.process.stdin.write((json.dumps(value) + "\n").encode())
-        self.process.stdin.flush()
+        with self.write_lock:
+            if self.closed or self.process.poll() is not None:
+                raise RuntimeError("vLLM worker is not running")
+            self.process.stdin.write((json.dumps(value) + "\n").encode())
+            self.process.stdin.flush()
+
+    def _details(self):
+        self.log.flush()
+        return self.log_path.read_text(errors="replace")[-12000:]
+
+    def _read(self):
+        try:
+            for raw in self.process.stdout:
+                line = raw.decode(errors="replace").rstrip("\n")
+                if not line.startswith(WIRE):
+                    self.log.write(line + "\n")
+                    self.log.flush()
+                    continue
+                event = json.loads(line[len(WIRE):])
+                request_id = event.get("request_id")
+                if event.get("event") == "ready" or (event.get("error") and request_id is None):
+                    if self.ready.empty():
+                        self.ready.put(event)
+                    continue
+                with self.state_lock:
+                    destination = self.pending.get(request_id)
+                if destination is not None:
+                    destination.put(event)
+        except BaseException as error:
+            terminal = {"error": f"{type(error).__name__}: {error}"}
+        else:
+            terminal = {"error": f"vLLM worker exited with code {self.process.poll()}"}
+        if self.ready.empty():
+            self.ready.put(terminal)
+        with self.state_lock:
+            destinations = list(self.pending.values())
+        for destination in destinations:
+            destination.put(terminal)
 
     def request(self, payload, cancelled=None, on_token=None):
-        with self.lock:
-            self._send(payload)
+        request_id = uuid.uuid4().hex
+        events = queue.Queue()
+        with self.state_lock:
+            if self.closed:
+                raise RuntimeError("vLLM worker is closed")
+            self.pending[request_id] = events
+        try:
+            self._send({**payload, "command": "generate", "request_id": request_id})
             while True:
                 if cancelled is not None and cancelled():
-                    self.close()
+                    with contextlib.suppress(Exception):
+                        self._send({"command": "abort", "request_id": request_id})
                     raise InterruptedError("Cancelled during vLLM AR generation")
-                if self.selector.select(timeout=.1):
-                    block = os.read(self.process.stdout.fileno(), 65536)
-                    if not block:
-                        break
-                    self.buffer += block
-                    while b"\n" in self.buffer:
-                        raw, self.buffer = self.buffer.split(b"\n", 1)
-                        line = raw.decode(errors="replace")
-                        if not line.startswith(WIRE):
-                            self.log.write(line + "\n")
-                            continue
-                        event = json.loads(line[len(WIRE):])
-                        if event.get("error"):
-                            self.close()
-                            raise RuntimeError(event["error"])
-                        if event.get("event") == "token" and on_token is not None:
-                            on_token(payload["phase"], event["token"])
-                        if event.get("event") == "result":
-                            return event["ids"], event["timing"], event["truncated"]
-                if self.process.poll() is not None:
-                    break
-            self.log.flush()
-            details = self.log_path.read_text(errors="replace")[-12000:]
-            self.close()
-            raise RuntimeError(f"vLLM worker exited without a result: {details}")
+                try:
+                    event = events.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                if event.get("error"):
+                    raise RuntimeError(f"{event['error']}\n{self._details()}")
+                if event.get("event") == "token" and on_token is not None:
+                    try:
+                        on_token(payload["phase"], event["token"])
+                    except BaseException:
+                        with contextlib.suppress(Exception):
+                            self._send({"command": "abort", "request_id": request_id})
+                        raise
+                if event.get("event") == "result":
+                    return event["ids"], event["timing"], event["truncated"]
+        finally:
+            with self.state_lock:
+                self.pending.pop(request_id, None)
 
     def close(self):
+        with self.state_lock:
+            if self.closed:
+                return
+            self.closed = True
         _stop_process(self.process)
         self.finalizer.detach()
-        self.selector.close()
+        if self.reader.is_alive() and threading.current_thread() is not self.reader:
+            self.reader.join(timeout=10)
         for stream in (self.process.stdin, self.process.stdout, self.log):
             if stream is not None and not stream.closed:
                 stream.close()
         self.temp.cleanup()
+
+
+def _ensure_vllm(pipe):
+    if importlib.util.find_spec("vllm") is None:
+        raise ImportError("Install the optional CUDA backend with uv pip install 'yue2-infer[fast]'")
+    with pipe._vllm_start_lock:
+        worker = getattr(pipe, "_vllm_worker", None)
+        if worker is None or worker.process.poll() is not None:
+            if worker is not None:
+                worker.close()
+            pipe._vllm_worker = _Worker(pipe)
+        return pipe._vllm_worker
+
+
+def preload_vllm(pipe):
+    """Start and retain the vLLM AR engine before the service becomes ready."""
+    if pipe.device.type != "cuda":
+        raise RuntimeError("vLLM requires CUDA")
+    _ensure_vllm(pipe)
 
 
 def close_vllm(pipe):
@@ -310,7 +383,6 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         reason = "experimental_fp8_uses_torch"
     if reason:
         from .sampling import generate_tokens
-        close_vllm(pipe)
         ids, timing, truncated = generate_tokens(pipe._load_model(), prefix, sampling, seed, phase,
                     negative=negative, cfg_scale=cfg_scale, legacy_off=legacy_off,
                     cancelled=cancelled, on_token=on_token)
@@ -318,23 +390,14 @@ def generate_vllm(pipe, prefix, sampling, seed, phase, negative=None, cfg_scale=
         return ids, timing, truncated
     if cancelled is not None and cancelled():
         raise InterruptedError("Cancelled before vLLM load")
-    if importlib.util.find_spec("vllm") is None:
-        raise ImportError("Install the optional CUDA backend with pip install 'yue2-infer[fast]'")
-    if getattr(pipe, "_vllm_worker", None) is None:
-        import torch
-        if pipe._model is not None:
-            pipe._model.to("cpu")
-        if getattr(pipe, "_vae", None) is not None:
-            pipe._vae.to("cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        pipe._vllm_worker = _Worker(pipe)
     payload = {"prefix": list(prefix), "sampling": dataclasses.asdict(sampling),
                "seed": seed, "phase": phase, "stream_tokens": on_token is not None}
+    worker = _ensure_vllm(pipe)
     try:
-        return pipe._vllm_worker.request(payload, cancelled, on_token)
+        return worker.request(payload, cancelled, on_token)
     except BaseException:
-        close_vllm(pipe)
+        if worker.process.poll() is not None:
+            close_vllm(pipe)
         raise
 
 
@@ -358,25 +421,23 @@ async def _worker_main():
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     derived = derive_ar_checkpoint(setup["model_dir"])
-    config = json.loads((derived / "config.json").read_text())
-    total = torch.cuda.get_device_properties(0).total_memory
-    budget = min(setup["memory_budget_gib"] * 2**30, total)
-    kv_bytes = kv_cache_bytes(config)
-    weights_bytes = (derived / "model.safetensors").stat().st_size
-    if kv_bytes + weights_bytes + 3 * 2**30 > budget:
-        raise MemoryError("Requested vLLM memory budget cannot fit full-context BF16 AR+KV+3GiB reserve")
+    max_num_seqs = int(setup["max_num_seqs"])
+    gpu_memory_utilization = float(setup["gpu_memory_utilization"])
     load_start = time.perf_counter()
     args = AsyncEngineArgs(model=str(derived), skip_tokenizer_init=True, dtype="bfloat16",
-                           max_model_len=CONTEXT, max_num_seqs=1, max_num_batched_tokens=2048,
+                           max_model_len=CONTEXT, max_num_seqs=max_num_seqs, max_num_batched_tokens=2048,
                            enable_chunked_prefill=True, enable_prefix_caching=True,
-                           kv_cache_memory_bytes=kv_bytes,
-                           gpu_memory_utilization=min(.9, (budget - 2 * 2**30) / total),
+                           gpu_memory_utilization=gpu_memory_utilization,
                            logits_processors=["yue2.fast:WindowedPenalty"], disable_log_stats=True)
     engine = AsyncLLM.from_engine_args(args)
     load_seconds = time.perf_counter() - load_start
-    try:
-        while line := await asyncio.to_thread(sys.stdin.readline):
-            request = json.loads(line)
+    load_lock = asyncio.Lock()
+    tasks = {}
+
+    async def generate(request):
+        nonlocal load_seconds
+        request_id = request["request_id"]
+        try:
             sampling = Sampling(**request["sampling"])
             abc = request["phase"] == "abc"
             end = ABC_END if abc else MUSIC_END
@@ -387,13 +448,13 @@ async def _worker_main():
                        allowed_token_ids=allowed, detokenize=False,
                        extra_args={PENALTY: sampling.repetition_penalty, WINDOW: sampling.penalty_window})
             start, first, output, sent = time.perf_counter(), None, None, 0
-            async for result in engine.generate({"prompt_token_ids": request["prefix"]}, params, str(uuid.uuid4())):
+            async for result in engine.generate({"prompt_token_ids": request["prefix"]}, params, request_id):
                 output = result.outputs[0]
                 if output.token_ids and first is None:
                     first = time.perf_counter() - start
                 if request["stream_tokens"]:
                     for token in output.token_ids[sent:]:
-                        _emit({"event": "token", "token": int(token)})
+                        _emit({"event": "token", "request_id": request_id, "token": int(token)})
                     sent = len(output.token_ids)
             if output is None:
                 raise RuntimeError("vLLM returned no output")
@@ -403,15 +464,48 @@ async def _worker_main():
                 ids.pop()
             elapsed = time.perf_counter() - start
             count = len(ids) + int(ended)
-            _emit({"event": "result", "ids": ids, "truncated": not ended,
+            async with load_lock:
+                request_load_seconds, load_seconds = load_seconds, 0.
+            _emit({"event": "result", "request_id": request_id, "ids": ids, "truncated": not ended,
                    "timing": {"seconds": elapsed, "ttft_seconds": first,
                        "output_tokens": count, "content_tokens": len(ids), "output_tps": count / elapsed,
                        "prefix_tokens": len(request["prefix"]), "cfg_branches": 1,
                        "backend_actual": "vllm", "backend_requested": "vllm",
-                       "engine_load_seconds": load_seconds, "kv_cache_memory_bytes": kv_bytes,
-                       "ar_derivation_identity": derived.name, "max_num_seqs": 1}})
-            load_seconds = 0.
+                       "engine_load_seconds": request_load_seconds,
+                       "gpu_memory_utilization": gpu_memory_utilization,
+                       "ar_derivation_identity": derived.name, "max_num_seqs": max_num_seqs}})
+        except asyncio.CancelledError:
+            await engine.abort(request_id)
+            raise
+        except BaseException as error:
+            _emit({"request_id": request_id, "error": f"{type(error).__name__}: {error}"})
+        finally:
+            tasks.pop(request_id, None)
+
+    _emit({"event": "ready", "max_num_seqs": max_num_seqs,
+           "gpu_memory_utilization": gpu_memory_utilization})
+    try:
+        while line := await asyncio.to_thread(sys.stdin.readline):
+            request = json.loads(line)
+            command, request_id = request.get("command"), request.get("request_id")
+            if command == "generate":
+                if request_id in tasks:
+                    _emit({"request_id": request_id, "error": "Duplicate request ID"})
+                else:
+                    tasks[request_id] = asyncio.create_task(generate(request))
+            elif command == "abort":
+                task = tasks.get(request_id)
+                if task is not None:
+                    await engine.abort(request_id)
+                    task.cancel()
+            else:
+                _emit({"request_id": request_id, "error": f"Unknown command: {command}"})
     finally:
+        remaining = list(tasks.values())
+        for task in remaining:
+            task.cancel()
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
         engine.shutdown()
 
 

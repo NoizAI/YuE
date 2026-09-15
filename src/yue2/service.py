@@ -1,4 +1,4 @@
-"""FastAPI + durable queue + one exclusive inference thread per GPU.
+"""FastAPI + durable queue + concurrent vLLM AR and serialized acoustic stages.
 
 The API process imports no torch until its inference worker starts. A test can
 inject a tiny pipeline without downloading weights or requiring a GPU.
@@ -6,6 +6,7 @@ inject a tiny pipeline without downloading weights or requiring a GPU.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import fcntl
 import gc
@@ -36,10 +37,14 @@ class Settings(BaseModel):
     revision: str | None = None
     vae_revision: str | None = None
     device: str = "cuda"
-    backend: Literal["torch", "torch-eager", "vllm"] = "torch"
-    resident_models: bool = True
+    backend: Literal["torch", "torch-eager", "vllm"] = "vllm"
+    resident_models: bool = False
     memory_budget_gib: float = Field(default=30, gt=2, allow_inf_nan=False)
     quantization: Literal["none", "fp8"] = "none"
+    ar_concurrency: int = Field(default=4, ge=1, le=16)
+    vllm_max_num_seqs: int = Field(default=4, ge=1, le=16)
+    vllm_gpu_memory_utilization: float = Field(default=.25, gt=0, le=.9, allow_inf_nan=False)
+    ar_batch_wait_ms: int = Field(default=50, ge=0, le=1000)
     ode_steps: int = Field(default=32, ge=1, le=64)
     vae_core_frames: int = Field(default=1024, ge=64, le=4096)
     max_pending: int = Field(default=16, ge=1, le=10000)
@@ -53,6 +58,8 @@ class Settings(BaseModel):
             raise ValueError("vLLM requires YUE2_RESIDENT_MODELS=false")
         if self.backend == "vllm" and self.quantization != "none":
             raise ValueError("The current vLLM adapter does not support FP8")
+        if self.backend == "vllm" and self.ar_concurrency > self.vllm_max_num_seqs:
+            raise ValueError("YUE2_AR_CONCURRENCY cannot exceed YUE2_VLLM_MAX_NUM_SEQS")
         return self
 
     @classmethod
@@ -91,6 +98,8 @@ def build_pipeline(settings):
         settings.model, vae=settings.vae, revision=settings.revision, vae_revision=settings.vae_revision,
         device=settings.device, backend=settings.backend, resident_models=settings.resident_models,
         memory_budget_gib=settings.memory_budget_gib, quantization=settings.quantization,
+        vllm_max_num_seqs=settings.vllm_max_num_seqs,
+        vllm_gpu_memory_utilization=settings.vllm_gpu_memory_utilization,
         vae_core_frames=settings.vae_core_frames, local_files_only=settings.local_files_only,
         generation_config=GenerationConfig(ode_steps=settings.ode_steps), progress=False)
 
@@ -103,7 +112,7 @@ class JobWorker:
         self.store = JobStore(self.root / "jobs.sqlite3")
         self.stop_event, self.wake = threading.Event(), threading.Event()
         self.lock = threading.Lock()
-        self.active = None
+        self.active = {}
         self.ready = False
         self.startup_error = False
         self.pipeline = None
@@ -131,8 +140,8 @@ class JobWorker:
         self.ready = False
         self.stop_event.set()
         with self.lock:
-            if self.active is not None:
-                self.active[1].set()
+            for cancel_event in self.active.values():
+                cancel_event.set()
         self.wake.set()
         if self.thread is not None:
             self.thread.join()  # cooperative cancellation; supervisor may force-stop a stuck CUDA driver
@@ -143,8 +152,9 @@ class JobWorker:
     def cancel(self, job_id):
         job = self.store.cancel(job_id)
         with self.lock:
-            if self.active is not None and self.active[0] == job_id:
-                self.active[1].set()
+            cancel_event = self.active.get(job_id)
+            if cancel_event is not None:
+                cancel_event.set()
         self.wake.set()
         return job
 
@@ -165,12 +175,20 @@ class JobWorker:
             self._load()
             while not self.stop_event.is_set():
                 self.wake.clear()
-                claimed = self.store.claim()
-                if claimed is None:
+                if self.settings.backend == "vllm" and self.settings.ar_concurrency > 1:
+                    # Briefly coalesce simultaneous submissions into one vLLM scheduling wave.
+                    self.stop_event.wait(self.settings.ar_batch_wait_ms / 1000)
+                claimed = self.store.claim_many(self.settings.ar_concurrency)
+                if not claimed:
                     self.wake.wait(0.5)
                     continue
-                job, request = claimed
-                self._execute(job, request)
+                rebuild = self._execute_claimed(claimed)
+                if rebuild and not self.stop_event.is_set():
+                    self.ready = False
+                    self.pipeline.close()
+                    self.pipeline = None
+                    gc.collect()
+                    self._load()
         except Exception:
             if not self.stop_event.is_set():
                 self.startup_error = True
@@ -180,74 +198,135 @@ class JobWorker:
             if self.pipeline is not None:
                 self.pipeline.close()
 
-    def _execute(self, job, request):
+    def _context(self, job, request):
         job_id, cancel_event = job["id"], threading.Event()
         with self.lock:
-            self.active = (job_id, cancel_event)
+            self.active[job_id] = cancel_event
         if self.store.get(job_id)["cancel_requested"]:
             cancel_event.set()
-        deadline = time.monotonic() + self.settings.task_timeout_seconds
-        counts, last_report = {"abc": 0, "semantic": 0}, 0.0
+        context = {
+            "job": job, "request": request, "cancel_event": cancel_event,
+            "deadline": time.monotonic() + self.settings.task_timeout_seconds,
+            "counts": {"abc": 0, "semantic": 0}, "last_report": 0.0,
+        }
 
         def cancelled():
-            return cancel_event.is_set() or self.stop_event.is_set() or time.monotonic() >= deadline
+            return (cancel_event.is_set() or self.stop_event.is_set()
+                    or time.monotonic() >= context["deadline"])
 
         def stage(name):
             if cancelled():
                 raise InterruptedError("Cancelled at stage boundary")
-            self.store.progress(job_id, stage=name, tokens=dict(counts))
+            self.store.progress(job_id, stage=name, tokens=dict(context["counts"]))
 
         def token(phase, value):
-            nonlocal last_report
-            counts[phase] = counts.get(phase, 0) + 1
+            context["counts"][phase] = context["counts"].get(phase, 0) + 1
             now = time.monotonic()
-            if now - last_report >= 1:
-                self.store.progress(job_id, tokens=dict(counts))
-                last_report = now
+            if now - context["last_report"] >= 1:
+                self.store.progress(job_id, tokens=dict(context["counts"]))
+                context["last_report"] = now
 
-        rebuild = False
-        try:
-            if cancelled():
-                raise InterruptedError("Cancelled before generation")
-            result = self.pipeline(**request, cancelled=cancelled, on_token=token, on_stage=stage)
-            stage("saving")
-            output = self.root / "artifacts" / job_id
-            output.mkdir(parents=True, exist_ok=False)
-            saved = result.save_artifacts(output)
-            if cancelled():
-                raise InterruptedError("Cancelled after saving")
-            truncated = any(saved["truncated"].values())
-            self.store.finish(job_id, "truncated" if truncated else "succeeded", result={
-                "audio_url": f"/v1/jobs/{job_id}/audio", "score_url": f"/v1/jobs/{job_id}/score" if result.abc else None,
-                "audio_seconds": saved["audio_seconds"], "sample_rate": saved["sample_rate"],
-                "truncated": saved["truncated"], "timing": saved["timing"],
-                "configuration": result.config,
-            })
-        except InterruptedError:
-            if time.monotonic() >= deadline and not cancel_event.is_set() and not self.stop_event.is_set():
-                self.store.finish(job_id, "failed", error={"code": "timeout", "message": "Generation exceeded its execution deadline."})
+        context.update(cancelled=cancelled, stage=stage, token=token)
+        return context
+
+    def _save_result(self, context, result):
+        job_id = context["job"]["id"]
+        context["stage"]("saving")
+        output = self.root / "artifacts" / job_id
+        output.mkdir(parents=True, exist_ok=False)
+        saved = result.save_artifacts(output)
+        if context["cancelled"]():
+            raise InterruptedError("Cancelled after saving")
+        truncated = any(saved["truncated"].values())
+        self.store.finish(job_id, "truncated" if truncated else "succeeded", result={
+            "audio_url": f"/v1/jobs/{job_id}/audio",
+            "score_url": f"/v1/jobs/{job_id}/score" if result.abc else None,
+            "audio_seconds": saved["audio_seconds"], "sample_rate": saved["sample_rate"],
+            "truncated": saved["truncated"], "timing": saved["timing"],
+            "configuration": result.config,
+        })
+
+    def _handle_error(self, context, error):
+        job_id = context["job"]["id"]
+        if isinstance(error, InterruptedError):
+            if (time.monotonic() >= context["deadline"] and not context["cancel_event"].is_set()
+                    and not self.stop_event.is_set()):
+                self.store.finish(job_id, "failed", error={
+                    "code": "timeout", "message": "Generation exceeded its execution deadline."})
             else:
                 self.store.finish(job_id, "cancelled")
+            return False
+        # Do not pass the exception object to logging handlers: handlers/mocks
+        # may retain traceback frames and the tensors referenced by them.
+        log.exception("Generation failed: job=%s", job_id)
+        invalid = isinstance(error, (ValueError, TypeError))
+        self.store.finish(job_id, "failed", error={
+            "code": "invalid_generation" if invalid else "inference_failed",
+            "message": ("Input could not be generated; check score and context length." if invalid
+                        else "Inference failed; see worker logs with this job ID."),
+        })
+        return not invalid
+
+    def _release_context(self, context):
+        with self.lock:
+            self.active.pop(context["job"]["id"], None)
+
+    def _execute_serial(self, context):
+        try:
+            if context["cancelled"]():
+                raise InterruptedError("Cancelled before generation")
+            result = self.pipeline(**context["request"], cancelled=context["cancelled"],
+                                   on_token=context["token"], on_stage=context["stage"])
+            self._save_result(context, result)
+            return False
         except Exception as error:
-            log.exception("Generation failed: job=%s", job_id)
-            invalid = isinstance(error, (ValueError, TypeError))
-            self.store.finish(job_id, "failed", error={
-                "code": "invalid_generation" if invalid else "inference_failed",
-                "message": "Input could not be generated; check score and context length." if invalid else "Inference failed; see worker logs with this job ID.",
-            })
-            # Release exception traceback frames before loading another model:
-            # they may retain the tensors that caused an out-of-memory failure.
-            self.ready = False
-            rebuild = True
+            return self._handle_error(context, error)
         finally:
-            with self.lock:
-                self.active = None
-        if rebuild:
-            self.pipeline.close()
-            self.pipeline = None
-            gc.collect()
-            if not self.stop_event.is_set():
-                self._load()
+            self._release_context(context)
+
+    def _execute_claimed(self, claimed):
+        contexts = [self._context(job, request) for job, request in claimed]
+        parallel, serial = [], []
+        supports = hasattr(self.pipeline, "generate_ar") and hasattr(self.pipeline, "render_ar")
+        for context in contexts:
+            if supports and self.pipeline.parallel_ar_eligible(context["request"]):
+                parallel.append(context)
+            else:
+                serial.append(context)
+        rebuild = False
+        if parallel:
+            prepared = {}
+            with ThreadPoolExecutor(max_workers=min(len(parallel), self.settings.ar_concurrency),
+                                    thread_name_prefix="yue2-ar") as executor:
+                futures = {
+                    context["job"]["id"]: executor.submit(
+                        self.pipeline.generate_ar, **context["request"],
+                        cancelled=context["cancelled"], on_token=context["token"],
+                        on_stage=context["stage"])
+                    for context in parallel
+                }
+                # Wait for all AR work so vLLM can batch it before serialized NAR/VAE.
+                for context in parallel:
+                    try:
+                        prepared[context["job"]["id"]] = futures[context["job"]["id"]].result()
+                    except Exception as error:
+                        rebuild |= self._handle_error(context, error)
+                        self._release_context(context)
+            for context in parallel:
+                ar_result = prepared.get(context["job"]["id"])
+                if ar_result is None:
+                    continue
+                try:
+                    result = self.pipeline.render_ar(
+                        ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
+                    self._save_result(context, result)
+                except Exception as error:
+                    rebuild |= self._handle_error(context, error)
+                finally:
+                    self._release_context(context)
+        for context in serial:
+            rebuild |= self._execute_serial(context)
+        return rebuild
 
 
 class BodyLimit:

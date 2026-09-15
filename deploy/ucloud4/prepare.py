@@ -11,8 +11,11 @@ if not env.exists():
         'YUE2_HOST=0.0.0.0', 'YUE2_PORT=8000',
         'YUE2_DATA_DIR=/opt/noiz-yue/jobs',
         'YUE2_MODEL=/opt/noiz-yue/models/YuE2-3B', 'YUE2_VAE=/opt/noiz-yue/models/YuE2-Vae',
-        'YUE2_LOCAL_FILES_ONLY=true', 'YUE2_DEVICE=cuda', 'YUE2_BACKEND=torch',
-        'YUE2_RESIDENT_MODELS=true', 'YUE2_MEMORY_BUDGET_GIB=30',
+        'YUE2_LOCAL_FILES_ONLY=true', 'YUE2_DEVICE=cuda', 'YUE2_BACKEND=vllm',
+        'YUE2_RESIDENT_MODELS=false', 'YUE2_AR_CONCURRENCY=4',
+        'YUE2_VLLM_MAX_NUM_SEQS=4', 'YUE2_VLLM_GPU_MEMORY_UTILIZATION=0.25',
+        'YUE2_AR_BATCH_WAIT_MS=50',
+        'YUE2_MEMORY_BUDGET_GIB=30',
         'YUE2_ODE_STEPS=32', 'YUE2_WARMUP=true', 'YUE2_MAX_PENDING=8',
         'YUE2_TASK_TIMEOUT_SECONDS=1200',
     ]) + '\n')

@@ -1,10 +1,12 @@
 """CPU interface/provenance checks; GPU tests are explicitly marked by skips."""
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -98,14 +100,19 @@ def test_worker_transport_handles_many_buffered_lines(monkeypatch):
     worker_code = """
 import sys,json
 json.loads(sys.stdin.readline())
+print('YUE2_FAST\\t'+json.dumps({'event':'ready'}),flush=True)
 for line in sys.stdin:
     q=json.loads(line)
+    if q.get('command')!='generate': continue
+    rid=q['request_id']
     lines=['YUE2_FAST\\t'+json.dumps({'event':'token','token':i}) for i in range(100)]
-    lines.append('YUE2_FAST\\t'+json.dumps({'event':'result','ids':[12], 'timing':{},'truncated':False}))
+    lines=[s[:-1]+',"request_id":'+json.dumps(rid)+'}' for s in lines]
+    lines.append('YUE2_FAST\\t'+json.dumps({'event':'result','request_id':rid,'ids':[12], 'timing':{},'truncated':False}))
     sys.stdout.write('\\n'.join(lines)+'\\n'); sys.stdout.flush()
 """
     monkeypatch.setattr(fast.subprocess, "Popen", lambda command, **kwargs: original_popen([sys.executable, '-c', worker_code], **kwargs))
-    pipe = SimpleNamespace(model_dir=Path('.'), device=torch.device('cpu'), memory_budget_gib=24)
+    pipe = SimpleNamespace(model_dir=Path('.'), device=torch.device('cpu'), memory_budget_gib=24,
+                           vllm_max_num_seqs=2)
     worker = fast._Worker(pipe)
     tokens = []
     try:
@@ -115,6 +122,67 @@ for line in sys.stdin:
     finally:
         worker.close()
     assert worker.process.poll() is not None
+
+
+def test_worker_multiplexes_concurrent_requests(monkeypatch):
+    original_popen = subprocess.Popen
+    worker_code = """
+import sys,json
+json.loads(sys.stdin.readline())
+print('YUE2_FAST\\t'+json.dumps({'event':'ready'}),flush=True)
+requests=[]
+while len(requests)<2:
+    q=json.loads(sys.stdin.readline())
+    if q.get('command')=='generate': requests.append(q)
+for q in reversed(requests):
+    print('YUE2_FAST\\t'+json.dumps({'event':'result','request_id':q['request_id'],
+          'ids':[q['seed']],'timing':{},'truncated':False}),flush=True)
+"""
+    monkeypatch.setattr(fast.subprocess, "Popen", lambda command, **kwargs:
+                        original_popen([sys.executable, '-c', worker_code], **kwargs))
+    pipe = SimpleNamespace(model_dir=Path('.'), device=torch.device('cpu'), memory_budget_gib=24,
+                           vllm_max_num_seqs=2)
+    worker = fast._Worker(pipe)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(worker.request, {'phase': 'abc', 'seed': seed})
+                       for seed in (11, 22)]
+            assert [future.result()[0] for future in futures] == [[11], [22]]
+    finally:
+        worker.close()
+
+
+def test_cancelling_one_request_keeps_worker_and_peer_alive(monkeypatch):
+    original_popen = subprocess.Popen
+    worker_code = """
+import sys,json
+json.loads(sys.stdin.readline())
+print('YUE2_FAST\\t'+json.dumps({'event':'ready'}),flush=True)
+for line in sys.stdin:
+    q=json.loads(line)
+    if q.get('command')=='generate' and q.get('seed')!=1:
+        print('YUE2_FAST\\t'+json.dumps({'event':'result','request_id':q['request_id'],
+              'ids':[q['seed']],'timing':{},'truncated':False}),flush=True)
+"""
+    monkeypatch.setattr(fast.subprocess, "Popen", lambda command, **kwargs:
+                        original_popen([sys.executable, '-c', worker_code], **kwargs))
+    pipe = SimpleNamespace(model_dir=Path('.'), device=torch.device('cpu'), memory_budget_gib=24,
+                           vllm_gpu_memory_utilization=.25, vllm_max_num_seqs=2)
+    worker = fast._Worker(pipe)
+    cancel = threading.Event()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cancelled = executor.submit(
+                worker.request, {'phase': 'abc', 'seed': 1}, cancel.is_set)
+            peer = executor.submit(worker.request, {'phase': 'abc', 'seed': 2})
+            assert peer.result(timeout=2)[0] == [2]
+            cancel.set()
+            with pytest.raises(InterruptedError):
+                cancelled.result(timeout=2)
+        assert worker.process.poll() is None
+        assert worker.request({'phase': 'abc', 'seed': 3})[0] == [3]
+    finally:
+        worker.close()
 
 
 def test_fp8_tensor_scaling_and_cpu_execution_guard():

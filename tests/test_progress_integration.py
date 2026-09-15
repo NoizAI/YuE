@@ -122,9 +122,11 @@ def test_user_token_callback_exception_propagates_with_failed_progress(monkeypat
 
 @pytest.mark.parametrize('enabled', [True, False])
 def test_pipeline_passes_acoustic_callbacks_only_when_enabled(enabled, monkeypatch, capsys):
-    pipe = bare_pipe(enabled)
+    pipe = bare_pipe(enabled, backend='vllm')
     pipe.quantization, pipe.offload_ar, pipe.vae_core_frames = 'none', False, 1
     pipe.device, pipe._model = torch.device('cpu'), None
+    monkeypatch.setattr(fast, 'close_vllm',
+                        lambda _: pytest.fail('Persistent vLLM engine closed before NAR/VAE'))
     expected = torch.arange(128, dtype=torch.float32).reshape(2, 64)
     seen = []
 

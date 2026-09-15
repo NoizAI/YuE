@@ -85,15 +85,24 @@ class JobStore:
             return json.loads(row[0]) if row else None
 
     def claim(self):
+        claimed = self.claim_many(1)
+        return claimed[0] if claimed else None
+
+    def claim_many(self, limit):
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("claim limit must be a positive integer")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT snapshot, request FROM jobs WHERE status='queued' ORDER BY created, id LIMIT 1").fetchone()
-            if row is None:
-                return None
-            job = json.loads(row[0])
-            job.update(status="running", stage="loading", started_at=time.time())
-            self._write(db, job)
-            return job, json.loads(row[1])
+            rows = db.execute(
+                "SELECT snapshot, request FROM jobs WHERE status='queued' ORDER BY created, id LIMIT ?",
+                (limit,)).fetchall()
+            claimed = []
+            for row in rows:
+                job = json.loads(row[0])
+                job.update(status="running", stage="loading", started_at=time.time())
+                self._write(db, job)
+                claimed.append((job, json.loads(row[1])))
+            return claimed
 
     def progress(self, job_id, **fields):
         with self.connect() as db:
