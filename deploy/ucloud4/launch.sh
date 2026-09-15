@@ -12,7 +12,10 @@ if ss -ltnH | awk '{print $4}' | grep -q ':8015$'; then
   echo 'Port 8015 is occupied; refusing to start.' >&2
   exit 1
 fi
+sudo -n docker network inspect noiz-yue-web-net >/dev/null 2>&1 ||
+  sudo -n docker network create noiz-yue-web-net >/dev/null
 sudo -n docker run -d --name noiz-yue-gpu5 --restart=unless-stopped --init \
+  --network=noiz-yue-web-net \
   --gpus "device=$gpu" --cpus=4 --memory=48g --shm-size=2g --user=1000:1000 \
   --publish 127.0.0.1:8015:8000 --env-file "$root/service.env" \
   -e CUDA_VISIBLE_DEVICES="$gpu" -e HF_HOME=/opt/noiz-yue/hf-cache \
