@@ -24,7 +24,7 @@ dependencies = [
 [project.optional-dependencies]
 fast = ["vllm==0.19.0", "triton==3.6.0"]
 server = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1",
-          "vllm==0.19.0", "triton==3.6.0"]
+          "httpx>=0.28,<1", "vllm==0.19.0", "triton==3.6.0"]
 test = ["pytest==9.0.3", "fastapi>=0.115,<1", "pydantic>=2.10,<3", "httpx>=0.28,<1"]
 
 [project.urls]
@@ -35,10 +35,14 @@ Models = "https://huggingface.co/m-a-p/YuE2-3B"
 [project.scripts]
 yue2 = "yue2.cli:main"
 yue2-serve = "yue2.service:main"
+yue2-web = "yue2.web_gateway:main"
 yue2-benchmark = "yue2.benchmark:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+yue2 = ["studio.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
