@@ -102,6 +102,8 @@ AR barrier 完成后，服务按原始 FIFO 顺序把连续兼容请求送入 pa
 默认并行参数针对当前 32 GB RTX 5090 设置为 4。`YUE2_VLLM_MAX_NUM_SEQS` 控制引擎容量，
 `YUE2_AR_CONCURRENCY` 控制服务同时提交的 AR 请求，后者不能大于前者。提高这两个值会线性增加
 KV 需求；4 路满 24576 上下文理论上约需 10.5 GiB KV。
+`YUE2_VLLM_MAX_NUM_BATCHED_TOKENS=8192` 控制一次调度可处理的 token 数，chunked prefill
+仍保持开启；它提高长 prompt 的 prefill 上限，但会增加引擎 profiling 的峰值和显存需求。
 `YUE2_AR_BATCH_WAIT_MS=50` 给同时到达的请求一个很短的合批窗口；低延迟优先时可调低，
 吞吐优先时可在压测后适当调高。
 `YUE2_NAR_BATCH_SIZE=4` 控制 NAR 窗口。请求不会按长度排序或分桶，每行保留自己的

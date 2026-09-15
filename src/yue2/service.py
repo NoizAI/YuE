@@ -43,6 +43,7 @@ class Settings(BaseModel):
     quantization: Literal["none", "fp8"] = "none"
     ar_concurrency: int = Field(default=4, ge=1, le=16)
     vllm_max_num_seqs: int = Field(default=4, ge=1, le=16)
+    vllm_max_num_batched_tokens: int = Field(default=8192, ge=1, le=24576)
     vllm_gpu_memory_utilization: float = Field(default=.3, gt=0, le=.9, allow_inf_nan=False)
     nar_batch_size: int = Field(default=4, ge=1, le=16)
     ar_batch_wait_ms: int = Field(default=50, ge=0, le=1000)
@@ -98,6 +99,7 @@ def build_pipeline(settings):
         device=settings.device, backend=settings.backend, resident_models=settings.resident_models,
         memory_budget_gib=settings.memory_budget_gib, quantization=settings.quantization,
         vllm_max_num_seqs=settings.vllm_max_num_seqs,
+        vllm_max_num_batched_tokens=settings.vllm_max_num_batched_tokens,
         vllm_gpu_memory_utilization=settings.vllm_gpu_memory_utilization,
         vae_core_frames=settings.vae_core_frames, local_files_only=settings.local_files_only,
         generation_config=GenerationConfig(ode_steps=settings.ode_steps), progress=False)

@@ -142,6 +142,7 @@ class YuE2Pipeline:
                  backend="torch", generation_config=None, verify_hashes=True,
                  vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
                  resident_models=False, vllm_max_num_seqs=4,
+                 vllm_max_num_batched_tokens=8192,
                  vllm_gpu_memory_utilization=.3):
         if not isinstance(resident_models, bool):
             raise TypeError("resident_models must be True or False")
@@ -159,6 +160,10 @@ class YuE2Pipeline:
             raise ValueError("memory_budget_gib must be positive")
         if isinstance(vllm_max_num_seqs, bool) or not isinstance(vllm_max_num_seqs, int) or vllm_max_num_seqs < 1:
             raise ValueError("vllm_max_num_seqs must be a positive integer")
+        if (isinstance(vllm_max_num_batched_tokens, bool)
+                or not isinstance(vllm_max_num_batched_tokens, int)
+                or not 1 <= vllm_max_num_batched_tokens <= 24576):
+            raise ValueError("vllm_max_num_batched_tokens must be in [1, 24576]")
         if not 0 < float(vllm_gpu_memory_utilization) <= .9:
             raise ValueError("vllm_gpu_memory_utilization must be in (0, 0.9]")
         if device == "auto":
@@ -175,6 +180,7 @@ class YuE2Pipeline:
         self.model_dir, self.vae_dir = Path(model_dir), Path(vae_dir)
         self.backend, self.quantization = backend, quantization
         self.vllm_max_num_seqs = vllm_max_num_seqs
+        self.vllm_max_num_batched_tokens = vllm_max_num_batched_tokens
         self.vllm_gpu_memory_utilization = float(vllm_gpu_memory_utilization)
         self._vllm_start_lock = threading.Lock()
         self.memory_budget_gib = float(memory_budget_gib)
@@ -432,6 +438,8 @@ class YuE2Pipeline:
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
                 "offload_ar": self.offload_ar, "resident_models": getattr(self, "resident_models", False),
                 "vllm_max_num_seqs": self.vllm_max_num_seqs if self.backend == "vllm" else None,
+                "vllm_max_num_batched_tokens": (
+                    self.vllm_max_num_batched_tokens if self.backend == "vllm" else None),
                 "vllm_gpu_memory_utilization": (
                     self.vllm_gpu_memory_utilization if self.backend == "vllm" else None),
                 "runtime_sha256": self.runtime_sha256,

@@ -241,7 +241,9 @@ class _Worker:
         self._send({"model_dir": str(pipe.model_dir), "device": str(pipe.device),
                     "gpu_memory_utilization": getattr(
                         pipe, "vllm_gpu_memory_utilization", .3),
-                    "max_num_seqs": getattr(pipe, "vllm_max_num_seqs", 1)})
+                    "max_num_seqs": getattr(pipe, "vllm_max_num_seqs", 1),
+                    "max_num_batched_tokens": getattr(
+                        pipe, "vllm_max_num_batched_tokens", 8192)})
         try:
             event = self.ready.get(timeout=1200)
         except queue.Empty:
@@ -422,10 +424,12 @@ async def _worker_main():
     from vllm.v1.engine.async_llm import AsyncLLM
     derived = derive_ar_checkpoint(setup["model_dir"])
     max_num_seqs = int(setup["max_num_seqs"])
+    max_num_batched_tokens = int(setup["max_num_batched_tokens"])
     gpu_memory_utilization = float(setup["gpu_memory_utilization"])
     load_start = time.perf_counter()
     args = AsyncEngineArgs(model=str(derived), skip_tokenizer_init=True, dtype="bfloat16",
-                           max_model_len=CONTEXT, max_num_seqs=max_num_seqs, max_num_batched_tokens=2048,
+                           max_model_len=CONTEXT, max_num_seqs=max_num_seqs,
+                           max_num_batched_tokens=max_num_batched_tokens,
                            enable_chunked_prefill=True, enable_prefix_caching=True,
                            gpu_memory_utilization=gpu_memory_utilization,
                            logits_processors=["yue2.fast:WindowedPenalty"], disable_log_stats=True)
@@ -473,7 +477,8 @@ async def _worker_main():
                        "backend_actual": "vllm", "backend_requested": "vllm",
                        "engine_load_seconds": request_load_seconds,
                        "gpu_memory_utilization": gpu_memory_utilization,
-                       "ar_derivation_identity": derived.name, "max_num_seqs": max_num_seqs}})
+                       "ar_derivation_identity": derived.name, "max_num_seqs": max_num_seqs,
+                       "max_num_batched_tokens": max_num_batched_tokens}})
         except asyncio.CancelledError:
             await engine.abort(request_id)
             raise
@@ -483,6 +488,7 @@ async def _worker_main():
             tasks.pop(request_id, None)
 
     _emit({"event": "ready", "max_num_seqs": max_num_seqs,
+           "max_num_batched_tokens": max_num_batched_tokens,
            "gpu_memory_utilization": gpu_memory_utilization})
     try:
         while line := await asyncio.to_thread(sys.stdin.readline):

@@ -493,10 +493,13 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     assert settings.resident_models and settings.backend == "vllm"
     assert settings.ar_concurrency == settings.vllm_max_num_seqs == 4
     assert settings.vllm_gpu_memory_utilization == .3
+    assert settings.vllm_max_num_batched_tokens == 8192
     assert settings.nar_batch_size == 4
     assert settings.ar_batch_wait_ms == 50
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)
+    with pytest.raises(ValidationError):
+        Settings(api_key=KEY, vllm_max_num_batched_tokens=24577)
     compatible = Settings(api_key=KEY, ar_concurrency=2, vllm_max_num_seqs=2)
     assert compatible.nar_batch_size == 4
