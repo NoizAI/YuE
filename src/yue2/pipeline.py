@@ -488,7 +488,11 @@ class YuE2Pipeline:
         from .nar import nar_batch_memory_estimate, song_chunks
         if not ar_results or any(not isinstance(result, ARResult) for result in ar_results):
             raise ValueError("NAR admission requires at least one ARResult")
-        model = self._load_model(for_nar=True)
+        try:
+            model = self._load_model(for_nar=True)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR admission could not load the acoustic model") from error
         songs = [
             song_chunks(result.semantic.plan.prefix, result.semantic.tokens,
                         result.semantic.plan.request.seed, self.generation_config.context)

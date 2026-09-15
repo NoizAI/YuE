@@ -112,13 +112,14 @@ class _AROverlapControl:
     def __init__(self):
         self.condition = threading.Condition()
         self.paused = False
+        self.cancelled = False
         self.ar_active = False
 
     def begin_ar(self, stop_event):
         with self.condition:
-            while self.paused and not stop_event.is_set():
+            while self.paused and not self.cancelled and not stop_event.is_set():
                 self.condition.wait(.1)
-            if stop_event.is_set():
+            if self.cancelled or stop_event.is_set():
                 return False
             self.ar_active = True
             self.condition.notify_all()
@@ -126,9 +127,9 @@ class _AROverlapControl:
 
     def wait_resumed(self, stop_event):
         with self.condition:
-            while self.paused and not stop_event.is_set():
+            while self.paused and not self.cancelled and not stop_event.is_set():
                 self.condition.wait(.1)
-            return not stop_event.is_set()
+            return not self.cancelled and not stop_event.is_set()
 
     def finish_ar(self):
         with self.condition:
@@ -143,6 +144,20 @@ class _AROverlapControl:
 
     def resume(self):
         with self.condition:
+            self.paused = False
+            self.condition.notify_all()
+
+    def cancel_and_wait(self):
+        with self.condition:
+            self.cancelled = True
+            self.paused = True
+            self.condition.notify_all()
+            while self.ar_active:
+                self.condition.wait(.1)
+
+    def restart(self):
+        with self.condition:
+            self.cancelled = False
             self.paused = False
             self.condition.notify_all()
 
@@ -271,6 +286,11 @@ class JobWorker:
                 self._handle_error(context, InterruptedError("Worker stopped"))
                 self._release_context(context)
 
+    def _quiesce_prefetch(self, control, future):
+        control.cancel_and_wait()
+        self.wake.set()
+        return future.result() if future is not None else None
+
     def _run_barrier(self):
         while not self.stop_event.is_set():
             claimed = self._claim_next()
@@ -282,16 +302,19 @@ class JobWorker:
 
     def _run_overlap(self):
         control = self.overlap_control = _AROverlapControl()
-        future = None
+        pending, future = None, None
         try:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="yue2-ar-prefetch") as prefetch:
                 future = prefetch.submit(self._claim_and_prepare, control)
                 while not self.stop_event.is_set():
-                    wave = future.result()
-                    future = None
+                    wave = pending if pending is not None else future.result()
+                    pending, future = None, None
                     if wave is None:
                         break
                     if wave["kind"] == "exclusive":
+                        deadline = time.monotonic() + self.settings.task_timeout_seconds
+                        for context in wave["contexts"]:
+                            context["deadline"] = deadline
                         rebuild = self._execute_contexts(wave["contexts"])
                         if rebuild and not self.stop_event.is_set():
                             self._reload_pipeline()
@@ -313,11 +336,22 @@ class JobWorker:
                     rebuild = self._render_prepared_segment(
                         wave["contexts"], wave["prepared"], control)
                     if rebuild and not self.stop_event.is_set():
-                        control.pause_and_wait()
-                        self._reload_pipeline()
-                    control.resume()
+                        pending = self._quiesce_prefetch(control, future)
+                        future = None
+                        try:
+                            self._reload_pipeline()
+                        except BaseException:
+                            self._cancel_wave(pending)
+                            pending = None
+                            raise
+                        control.restart()
+                    elif control.paused:
+                        control.resume()
+                    if pending is None and future is None and not self.stop_event.is_set():
+                        future = prefetch.submit(self._claim_and_prepare, control)
                 if future is not None:
                     self._cancel_wave(future.result())
+                self._cancel_wave(pending)
         finally:
             control.resume()
             self.overlap_control = None
@@ -467,16 +501,18 @@ class JobWorker:
     def _render_prepared(self, context, ar_result, control=None):
         self._mark_acoustic_start(control, [context])
         try:
+            result = None
             for attempt in range(2 if control is not None else 1):
                 try:
                     result = self.pipeline.render_ar(
                         ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
-                    self._save_result(context, result)
-                    return False
                 except MemoryError:
                     if attempt == 0 and self._pause_for_pressure(control, [context]):
                         continue
                     raise
+                break
+            self._save_result(context, result)
+            return False
         except Exception as error:
             return self._handle_error(context, error)
         finally:
@@ -484,16 +520,18 @@ class JobWorker:
 
     def _render_nar_result(self, context, nar_result, control=None):
         try:
+            result = None
             for attempt in range(2 if control is not None else 1):
                 try:
                     result = self.pipeline.render_nar(
                         nar_result, cancelled=context["cancelled"], on_stage=context["stage"])
-                    self._save_result(context, result)
-                    return False
                 except MemoryError:
                     if attempt == 0 and self._pause_for_pressure(control, [context]):
                         continue
                     raise
+                break
+            self._save_result(context, result)
+            return False
         except Exception as error:
             return self._handle_error(context, error)
         finally:

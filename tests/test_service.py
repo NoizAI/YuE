@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from yue2.service import GenerateRequest, JobWorker, Settings, create_app
+from yue2.service import _AROverlapControl, GenerateRequest, JobWorker, Settings, create_app
 from yue2.service_store import JobStore, QueueFull
 
 KEY = "test-only-api-key-123456789"
@@ -387,7 +387,8 @@ def test_worker_overlaps_next_ar_wave_or_waits_on_pressure(tmp_path, mode):
         worker.stop()
 
 
-def test_overlap_rebuild_waits_for_inflight_ar_and_keeps_next_wave(tmp_path):
+@pytest.mark.parametrize("reload_fails", [False, True])
+def test_overlap_rebuild_waits_for_inflight_ar_and_resolves_next_wave(tmp_path, reload_fails):
     class RebuildPipeline:
         def __init__(self):
             self.lock = threading.Lock()
@@ -440,15 +441,80 @@ def test_overlap_rebuild_waits_for_inflight_ar_and_keeps_next_wave(tmp_path):
     settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
                         vllm_max_num_seqs=2, ar_batch_wait_ms=0)
     pipe = RebuildPipeline()
-    worker = JobWorker(settings, lambda _: pipe)
+    loads = 0
+
+    def factory(_):
+        nonlocal loads
+        loads += 1
+        if reload_fails and loads > 1:
+            raise RuntimeError("simulated reload failure")
+        return pipe
+
+    worker = JobWorker(settings, factory)
     jobs = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in (1, 2, 3, 4)]
     worker.start()
     try:
         wait_for(lambda: all(worker.store.get(job["id"])["status"] in
                             {"succeeded", "failed", "cancelled", "truncated"} for job in jobs))
-        assert [worker.store.get(job["id"])["status"] for job in jobs] == [
-            "failed", "failed", "succeeded", "succeeded"]
+        expected = (["failed", "failed", "cancelled", "cancelled"] if reload_fails
+                    else ["failed", "failed", "succeeded", "succeeded"])
+        assert [worker.store.get(job["id"])["status"] for job in jobs] == expected
         assert pipe.closes >= 1
+    finally:
+        worker.stop()
+
+
+def test_prefetched_exclusive_wave_gets_execution_deadline_when_consumed(tmp_path):
+    class ExclusivePipeline:
+        def preload(self):
+            pass
+
+        def close(self):
+            pass
+
+        def parallel_ar_eligible(self, request):
+            return request.get("cot") != "off"
+
+        def generate_ar(self, *, seed, **kwargs):
+            return seed
+
+        def nar_batch_admission(self, results):
+            return {"allowed": True}
+
+        def generate_nar_batch(self, results, **kwargs):
+            if results == [1, 2]:
+                time.sleep(.08)
+            return list(results)
+
+        def render_nar(self, seed, **kwargs):
+            return self.result(seed)
+
+        def render_ar(self, seed, **kwargs):
+            return self.result(seed)
+
+        def __call__(self, *, seed, **kwargs):
+            return self.result(seed)
+
+        def result(self, seed):
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
+                        vllm_max_num_seqs=2, ar_batch_wait_ms=0, task_timeout_seconds=.05)
+    pipe = ExclusivePipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    requests = [{**REQUEST, "seed": 1}, {**REQUEST, "seed": 2},
+                {**REQUEST, "seed": 3, "cot": "off"}, {**REQUEST, "seed": 4}]
+    jobs = [worker.store.submit(request, 4)[0] for request in requests]
+    worker.start()
+    try:
+        wait_for(lambda: all(worker.store.get(job["id"])["status"] in
+                            {"succeeded", "failed", "cancelled", "truncated"} for job in jobs))
+        assert [worker.store.get(job["id"])["status"] for job in jobs[2:]] == [
+            "succeeded", "succeeded"]
     finally:
         worker.stop()
 
@@ -545,6 +611,30 @@ def test_worker_falls_back_to_single_rows_after_batch_two_oom(tmp_path):
     assert pipe.calls == [[0, 1], [2, 3]]
     assert pipe.serial == [0, 1]
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in jobs)
+
+
+def test_memory_error_while_saving_does_not_retry_render(tmp_path):
+    class SaveFailurePipeline:
+        def __init__(self):
+            self.renders = 0
+
+        def render_ar(self, seed, **kwargs):
+            self.renders += 1
+
+            def save(output):
+                raise MemoryError("host save allocation failed")
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False)
+    pipe = SaveFailurePipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    job, request = worker.store.submit({**REQUEST, "seed": 1}, 1)[0], {**REQUEST, "seed": 1}
+    claimed_job, _ = worker.store.claim()
+    context = worker._context(claimed_job, request)
+    assert worker._render_prepared(context, 1, _AROverlapControl())
+    assert pipe.renders == 1
+    assert worker.store.get(job["id"])["status"] == "failed"
 
 
 def test_worker_keeps_nar_row_failure_independent(tmp_path):

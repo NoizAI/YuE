@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from yue2.modeling_vae import YuE2VAE, YuE2VAEConfig
-from yue2.pipeline import YuE2Pipeline
+from yue2.pipeline import ARResult, YuE2Pipeline
 
 
 def tiny_decoder():
@@ -22,6 +22,16 @@ def pipe_with(decoder, resident):
     pipe.resident_models, pipe.vae_core_frames = resident, 4
     pipe._model, pipe._vae = Mock(), decoder
     return pipe
+
+
+def test_nar_admission_translates_model_load_oom():
+    pipe = object.__new__(YuE2Pipeline)
+    pipe._load_model = Mock(side_effect=torch.OutOfMemoryError("simulated"))
+    result = ARResult(None, {}, "request", 0)
+    with patch("torch.cuda.empty_cache") as empty:
+        with pytest.raises(MemoryError, match="admission"):
+            pipe.nar_batch_admission([result])
+    empty.assert_called_once()
 
 
 def test_residency_eliminates_offloads_and_preserves_real_decoder_output():
