@@ -435,6 +435,6 @@ class YuE2Pipeline:
         return SongResult(audio, 48000, semantic, latents, config, self.weights, timing, request_id)
 
     def generate_batch(self, requests, **kwargs):
-        """Experimental batch=2 AR forwards; see yue2.batching for limits."""
+        """Experimental batched AR forwards; see yue2.batching for limits."""
         from .batching import generate_batch
         return generate_batch(self, requests, **kwargs)

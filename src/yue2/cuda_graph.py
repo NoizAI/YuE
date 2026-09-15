@@ -40,13 +40,15 @@ class GraphAR:
     output storage and remain valid until the next step. ``capture=False`` is
     an eager diagnostic path for CPU/tiny-model correctness checks.
     """
+    max_branches = 2
+
     def __init__(self, model, prefixes, max_tokens, *, capture=True, attention_backend="auto", fuse_projections=False):
         if model.training:
             raise ValueError("GraphAR requires model.eval()")
         if isinstance(max_tokens, bool) or not isinstance(max_tokens, Integral) or max_tokens < 1:
             raise ValueError("max_tokens must be a positive integer")
         prefixes = [list(prefix) for prefix in prefixes]
-        if len(prefixes) not in {1, 2}:
+        if not 1 <= len(prefixes) <= self.max_branches:
             raise ValueError("GraphAR supports one request or exactly two CFG branches")
         config = model.config
         for prefix in prefixes:
