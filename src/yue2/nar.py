@@ -202,6 +202,243 @@ class CachedNAR:
         self.cos = self.sin = self.pos_emb = None
 
 
+def _pad_first_dim(tensors):
+    if not tensors:
+        raise ValueError("Expected at least one tensor")
+    width = max(len(tensor) for tensor in tensors)
+    result = tensors[0].new_zeros((len(tensors), width, *tensors[0].shape[1:]))
+    for row, tensor in enumerate(tensors):
+        result[row, :len(tensor)] = tensor
+    return result
+
+
+def _batched_attention(q, ar_k, ar_v, nar_k, nar_v, query_lengths, ar_lengths,
+                       backend="sdpa", query_chunk_size=None):
+    """Row-wise unmasked SDPA avoids masked-GQA's quadratic fallback on CUDA."""
+    if (q.ndim != 4 or ar_k.ndim != 4 or nar_k.ndim != 4
+            or ar_v.shape != ar_k.shape or nar_v.shape != nar_k.shape):
+        raise ValueError("Expected batched Q/K/V [batch,tokens,heads,dim]")
+    if len(query_lengths) != len(q) or len(ar_lengths) != len(q):
+        raise ValueError("Attention lengths must align with batch rows")
+    result = torch.zeros_like(q)
+    for row, (query_length, ar_length) in enumerate(zip(query_lengths, ar_lengths)):
+        key = torch.cat((ar_k[row, :ar_length], nar_k[row, :query_length]))
+        value = torch.cat((ar_v[row, :ar_length], nar_v[row, :query_length]))
+        result[row, :query_length] = attention(
+            q[row, :query_length], key, value, backend=backend,
+            query_chunk_size=query_chunk_size)
+    return result
+
+
+class BatchedCachedNAR:
+    """Padded NAR rows with serial prefix prefill and shared ODE forwards."""
+
+    def __init__(self, model, chunks, attention="sdpa", query_chunk_size=None):
+        if len(chunks) < 2:
+            raise ValueError("BatchedCachedNAR requires at least two chunks")
+        if attention not in {"sdpa", "math", "flash"}:
+            raise ValueError("attention must be sdpa, math, or flash")
+        self.model, self.chunks = model, list(chunks)
+        self.backend, self.query_chunk_size = attention, query_chunk_size
+        weight = next(model.vae2llm.parameters())
+        self.device, self.dtype = weight.device, weight.dtype
+        engines = []
+        try:
+            engines = [CachedNAR(model, chunk, attention, query_chunk_size) for chunk in self.chunks]
+            self.frame_lengths = [len(chunk.noise) for chunk in self.chunks]
+            self.nar_lengths = [engine.nar_length for engine in engines]
+            self.max_frames, self.max_nar = max(self.frame_lengths), max(self.nar_lengths)
+            self.cos = _pad_first_dim([engine.cos[0] for engine in engines])
+            self.sin = _pad_first_dim([engine.sin[0] for engine in engines])
+            self.pos_emb = _pad_first_dim([engine.pos_emb[0] for engine in engines])
+            visible = [len(engine.cache[0][0]) for engine in engines]
+            self.cache = []
+            for layer in range(len(engines[0].cache)):
+                self.cache.append((
+                    _pad_first_dim([engine.cache[layer][0] for engine in engines]),
+                    _pad_first_dim([engine.cache[layer][1] for engine in engines]),
+                ))
+                for engine in engines:
+                    engine.cache[layer] = (None, None)
+            frame_positions = torch.arange(self.max_frames, device=self.device)
+            self.frame_valid = frame_positions[None] < torch.tensor(
+                self.frame_lengths, device=self.device)[:, None]
+            self.ar_lengths = visible
+        finally:
+            for engine in engines:
+                engine.close()
+
+    @torch.inference_mode()
+    def velocity(self, state, raw_t):
+        expected = (len(self.chunks), self.max_frames, 64)
+        if tuple(state.shape) != expected:
+            raise ValueError(f"Expected padded batch state {expected}")
+        model = self.model
+        x_nar = state.new_zeros((len(self.chunks), self.max_nar, 64), dtype=self.dtype)
+        x_nar[:, 1:1 + self.max_frames] = state.to(self.dtype)
+        shifted = model._shift_t_value(raw_t, self.device, self.dtype)
+        x = model.vae2llm(x_nar)
+        x = x + model.time_embedder(shifted.expand(len(self.chunks), self.max_nar))
+        x = x + self.pos_emb
+        for layer, (ar_k, ar_v) in zip(model.model.layers, self.cache):
+            q, k, v = layer.nar_self_attn.project_qkv(
+                layer.nar_input_layernorm(x), self.cos, self.sin)
+            h = _batched_attention(
+                q, ar_k, ar_v, k, v, self.nar_lengths, self.ar_lengths,
+                self.backend, self.query_chunk_size)
+            x = x + layer.nar_self_attn.o_proj(h.flatten(2))
+            x = x + layer.nar_mlp(layer.nar_pre_mlp_layernorm(x))
+        result = model.llm2vae(model.model.norm(x))[:, 1:1 + self.max_frames]
+        return result.masked_fill(~self.frame_valid[..., None], 0)
+
+    @torch.inference_mode()
+    def solve(self, steps=32, cancelled=None, on_progress=None):
+        if isinstance(steps, bool) or not isinstance(steps, Integral) or steps < 1:
+            raise ValueError("steps must be a positive integer")
+        callbacks = list(cancelled or [None] * len(self.chunks))
+        progress = list(on_progress or [None] * len(self.chunks))
+        if len(callbacks) != len(self.chunks) or len(progress) != len(self.chunks):
+            raise ValueError("Callbacks must align with batch rows")
+        state = _pad_first_dim([
+            chunk.noise.to(device=self.device, dtype=self.dtype) for chunk in self.chunks])
+        active = [not (callback is not None and callback()) for callback in callbacks]
+        dt = 1.0 / steps
+        for step in range(steps):
+            if not any(active):
+                break
+            t = 1.0 - step * dt
+            raw = torch.logit(torch.tensor(t, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
+            first = self.velocity(state, raw)
+            update = (torch.tensor(active, device=self.device)[:, None]
+                      & self.frame_valid)[..., None]
+            midpoint = torch.where(update, state - first * (dt / 2), state)
+            for row, callback in enumerate(callbacks):
+                if active[row] and callback is not None and callback():
+                    active[row] = False
+            if not any(active):
+                break
+            raw_mid = torch.logit(
+                torch.tensor(t - dt / 2, dtype=torch.float64, device="cpu")).clamp(-20, 20).item()
+            second = self.velocity(midpoint, raw_mid)
+            update = (torch.tensor(active, device=self.device)[:, None]
+                      & self.frame_valid)[..., None]
+            state = torch.where(update, state - second * dt, state)
+            for row, callback in enumerate(progress):
+                if active[row] and callback is not None:
+                    callback(step + 1, int(steps))
+        results = []
+        for row, length in enumerate(self.frame_lengths):
+            result = state[row, :length].float().cpu() if active[row] else None
+            if result is not None and not torch.isfinite(result).all():
+                raise FloatingPointError("Acoustic flow matching produced non-finite latents")
+            results.append(result)
+        return results
+
+    def close(self):
+        self.cache.clear()
+        self.cos = self.sin = self.pos_emb = None
+        self.frame_valid = None
+
+
+def nar_batch_memory_estimate(model, songs, reserve_gib=4):
+    """Conservative padded-cache admission for one chunk per FIFO song."""
+    chunks = [chunk for song in songs for chunk in song]
+    batch = len(songs)
+    if not chunks or batch < 1:
+        raise ValueError("Expected nonempty song chunks")
+    config = model.config
+    dtype_bytes = next(model.parameters()).element_size()
+    max_visible = max(
+        min(chunk.nar_cond_end, len(chunk.ar_tokens)) if chunk.nar_cond_end
+        else len(chunk.ar_tokens) for chunk in chunks)
+    max_nar = max(len(chunk.noise) + 2 for chunk in chunks)
+    cache_bytes = (2 * config.num_hidden_layers * batch * max_visible
+                   * config.num_key_value_heads * config.head_dim * dtype_bytes)
+    qkv = (config.num_attention_heads + 2 * config.num_key_value_heads) * config.head_dim
+    activation_width = qkv + 4 * config.hidden_size + 2 * config.intermediate_size
+    activation_bytes = batch * max_nar * activation_width * dtype_bytes
+    required = int(cache_bytes * 1.2 + activation_bytes * 2 + 2 * 2**30)
+    result = {
+        "batch_size": batch, "max_visible_tokens": max_visible, "max_nar_tokens": max_nar,
+        "cache_bytes": cache_bytes, "activation_bytes": activation_bytes,
+        "required_bytes": required, "reserve_bytes": int(reserve_gib * 2**30),
+    }
+    device = next(model.parameters()).device
+    if device.type != "cuda":
+        return dict(result, available_bytes=None, allowed=True)
+    free, _ = torch.cuda.mem_get_info(device)
+    reclaimable = max(torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device), 0)
+    available = free + reclaimable
+    return dict(result, available_bytes=available,
+                allowed=required + result["reserve_bytes"] <= available)
+
+
+@torch.inference_mode()
+def synthesize_batch(model, prefixes, codecs, seeds, steps=32, context=CONTEXT,
+                     attention="sdpa", cancelled=None, query_chunk_size=None,
+                     on_progress=None):
+    """Batch FIFO songs without length sorting; return latents or row cancellation."""
+    prefixes, codecs, seeds = list(prefixes), list(codecs), list(seeds)
+    if not prefixes or not (len(prefixes) == len(codecs) == len(seeds)):
+        raise ValueError("Batch inputs must be nonempty and aligned")
+    callbacks = list(cancelled or [None] * len(prefixes))
+    progress = list(on_progress or [None] * len(prefixes))
+    if len(callbacks) != len(prefixes) or len(progress) != len(prefixes):
+        raise ValueError("Callbacks must align with songs")
+    songs = [song_chunks(prefix, codec, seed, context)
+             for prefix, codec, seed in zip(prefixes, codecs, seeds)]
+    completed, outputs = [0] * len(songs), [[] for _ in songs]
+    stopped = [False] * len(songs)
+    while any(completed[row] < len(songs[row]) and not stopped[row] for row in range(len(songs))):
+        rows = [row for row in range(len(songs))
+                if completed[row] < len(songs[row]) and not stopped[row]]
+        for row in list(rows):
+            if callbacks[row] is not None and callbacks[row]():
+                stopped[row] = True
+                rows.remove(row)
+        if not rows:
+            break
+        chunks = [songs[row][completed[row]] for row in rows]
+        row_progress = []
+        for row in rows:
+            offset, total = completed[row] * steps, len(songs[row]) * steps
+            callback = progress[row]
+            row_progress.append(
+                None if callback is None
+                else lambda done, _steps, callback=callback, offset=offset, total=total:
+                    callback(offset + done, total))
+        if len(rows) == 1:
+            row = rows[0]
+            engine = CachedNAR(model, chunks[0], attention, query_chunk_size)
+            try:
+                result = engine.solve(steps, callbacks[row], row_progress[0])
+            except InterruptedError:
+                stopped[row] = True
+            else:
+                outputs[row].append(result)
+                completed[row] += 1
+            finally:
+                engine.close()
+            continue
+        engine = BatchedCachedNAR(model, chunks, attention, query_chunk_size)
+        try:
+            results = engine.solve(
+                steps, [callbacks[row] for row in rows], row_progress)
+            for row, result in zip(rows, results):
+                if result is None:
+                    stopped[row] = True
+                else:
+                    outputs[row].append(result)
+                    completed[row] += 1
+        finally:
+            engine.close()
+    return [
+        InterruptedError("Cancelled during acoustic flow matching") if stopped[row]
+        else torch.cat(outputs[row], dim=0)
+        for row in range(len(songs))
+    ]
+
+
 @contextmanager
 def _offload_ar(model, enabled):
     """Temporarily move unused AR modules; this model cannot serve concurrently."""

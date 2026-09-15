@@ -300,7 +300,7 @@ def test_worker_batches_vllm_ar_and_serializes_render(tmp_path):
             return SimpleNamespace(abc=None, config={"backend": "vllm"}, save_artifacts=save)
 
     settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
-                        vllm_max_num_seqs=2)
+                        vllm_max_num_seqs=2, nar_batch_size=2)
     pipe = ParallelPipeline()
     worker = JobWorker(settings, lambda _: pipe)
     worker.pipeline = pipe
@@ -308,6 +308,171 @@ def test_worker_batches_vllm_ar_and_serializes_render(tmp_path):
     assert worker._execute_claimed(worker.store.claim_many(2)) is False
     assert pipe.ar_peak == 2 and pipe.render_peak == 1
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
+
+
+def test_worker_batches_nar_in_fifo_windows_and_keeps_vae_serial(tmp_path):
+    class BatchedPipeline:
+        def __init__(self):
+            self.events = []
+            self.decode_active = self.decode_peak = 0
+
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, **kwargs):
+            return seed
+
+        def nar_batch_admission(self, results):
+            self.events.append(("admit", list(results)))
+            return {"allowed": len(results) <= 2}
+
+        def generate_nar_batch(self, results, **kwargs):
+            self.events.append(("nar", list(results)))
+            return [("latent", seed) for seed in results]
+
+        def render_nar(self, nar_result, **kwargs):
+            seed = nar_result[1]
+            self.events.append(("decode", seed))
+            self.decode_active += 1
+            self.decode_peak = max(self.decode_peak, self.decode_active)
+            self.decode_active -= 1
+
+            def save(output):
+                self.events.append(("save", seed))
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={"nar_batch_size": 2}, save_artifacts=save)
+
+        def render_ar(self, seed, **kwargs):
+            raise AssertionError(f"Unexpected serial NAR fallback for {seed}")
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False)
+    pipe = BatchedPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    submitted = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0]
+                 for seed in (41, 42, 43, 44)]
+    assert worker._execute_claimed(worker.store.claim_many(4)) is False
+    assert [event for event in pipe.events if event[0] == "nar"] == [
+        ("nar", [41, 42]), ("nar", [43, 44])]
+    assert [event[1] for event in pipe.events if event[0] == "save"] == [41, 42, 43, 44]
+    assert pipe.decode_peak == 1
+    assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
+
+
+def test_worker_retries_runtime_nar_oom_as_two_fifo_pairs(tmp_path):
+    class RuntimeFallbackPipeline:
+        def __init__(self):
+            self.calls = []
+
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, **kwargs):
+            return seed
+
+        def nar_batch_admission(self, results):
+            return {"allowed": True}
+
+        def generate_nar_batch(self, results, **kwargs):
+            self.calls.append(list(results))
+            if len(results) == 4:
+                raise MemoryError("simulated runtime pressure")
+            return list(results)
+
+        def render_nar(self, seed, **kwargs):
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+        def render_ar(self, seed, **kwargs):
+            raise AssertionError(f"Unexpected single-row fallback for {seed}")
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False)
+    pipe = RuntimeFallbackPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    jobs = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in range(4)]
+    assert worker._execute_claimed(worker.store.claim_many(4)) is False
+    assert pipe.calls == [[0, 1, 2, 3], [0, 1], [2, 3]]
+    assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in jobs)
+
+
+def test_worker_keeps_nar_row_failure_independent(tmp_path):
+    class RowFailurePipeline:
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, **kwargs):
+            return seed
+
+        def nar_batch_admission(self, results):
+            return {"allowed": True}
+
+        def generate_nar_batch(self, results, **kwargs):
+            return [ValueError("bad first row"), results[1]]
+
+        def render_nar(self, seed, **kwargs):
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+        def render_ar(self, seed, **kwargs):
+            raise AssertionError(f"Unexpected single-row fallback for {seed}")
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, nar_batch_size=2)
+    pipe = RowFailurePipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    jobs = [worker.store.submit({**REQUEST, "seed": seed}, 2)[0] for seed in (1, 2)]
+    assert worker._execute_claimed(worker.store.claim_many(2)) is False
+    assert [worker.store.get(job["id"])["status"] for job in jobs] == ["failed", "succeeded"]
+
+
+def test_worker_does_not_reorder_fifo_across_ineligible_job(tmp_path):
+    class MixedPipeline:
+        def __init__(self):
+            self.saved = []
+            self.started = []
+
+        def parallel_ar_eligible(self, request):
+            return request.get("cot") != "off"
+
+        def generate_ar(self, *, seed, **kwargs):
+            self.started.append(seed)
+            return seed
+
+        def render_ar(self, seed, **kwargs):
+            return self.result(seed)
+
+        def __call__(self, *, seed, **kwargs):
+            self.started.append(seed)
+            return self.result(seed)
+
+        def result(self, seed):
+            def save(output):
+                self.saved.append(seed)
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, nar_batch_size=4)
+    pipe = MixedPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    worker.pipeline = pipe
+    requests = [{**REQUEST, "seed": 1}, {**REQUEST, "seed": 2, "cot": "off"},
+                {**REQUEST, "seed": 3}]
+    jobs = [worker.store.submit(request, 3)[0] for request in requests]
+    assert worker._execute_claimed(worker.store.claim_many(3)) is False
+    assert pipe.started == [1, 2, 3]
+    assert pipe.saved == [1, 2, 3]
+    assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in jobs)
 
 
 def test_cancel_racing_success_cannot_publish_result(tmp_path):
@@ -328,7 +493,10 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     assert settings.resident_models and settings.backend == "vllm"
     assert settings.ar_concurrency == settings.vllm_max_num_seqs == 4
     assert settings.vllm_gpu_memory_utilization == .3
+    assert settings.nar_batch_size == 4
     assert settings.ar_batch_wait_ms == 50
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)
+    with pytest.raises(ValidationError):
+        Settings(api_key=KEY, ar_concurrency=2, nar_batch_size=3)

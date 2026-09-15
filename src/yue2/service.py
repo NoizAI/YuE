@@ -44,6 +44,7 @@ class Settings(BaseModel):
     ar_concurrency: int = Field(default=4, ge=1, le=16)
     vllm_max_num_seqs: int = Field(default=4, ge=1, le=16)
     vllm_gpu_memory_utilization: float = Field(default=.3, gt=0, le=.9, allow_inf_nan=False)
+    nar_batch_size: int = Field(default=4, ge=1, le=16)
     ar_batch_wait_ms: int = Field(default=50, ge=0, le=1000)
     ode_steps: int = Field(default=32, ge=1, le=64)
     vae_core_frames: int = Field(default=1024, ge=64, le=4096)
@@ -58,6 +59,8 @@ class Settings(BaseModel):
             raise ValueError("The current vLLM adapter does not support FP8")
         if self.backend == "vllm" and self.ar_concurrency > self.vllm_max_num_seqs:
             raise ValueError("YUE2_AR_CONCURRENCY cannot exceed YUE2_VLLM_MAX_NUM_SEQS")
+        if self.backend == "vllm" and self.nar_batch_size > self.ar_concurrency:
+            raise ValueError("YUE2_NAR_BATCH_SIZE cannot exceed YUE2_AR_CONCURRENCY")
         return self
 
     @classmethod
@@ -282,48 +285,134 @@ class JobWorker:
         finally:
             self._release_context(context)
 
-    def _execute_claimed(self, claimed):
-        contexts = [self._context(job, request) for job, request in claimed]
-        parallel, serial = [], []
-        supports = hasattr(self.pipeline, "generate_ar") and hasattr(self.pipeline, "render_ar")
-        for context in contexts:
-            if supports and self.pipeline.parallel_ar_eligible(context["request"]):
-                parallel.append(context)
-            else:
-                serial.append(context)
+    def _render_prepared(self, context, ar_result):
+        try:
+            result = self.pipeline.render_ar(
+                ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
+            self._save_result(context, result)
+            return False
+        except Exception as error:
+            return self._handle_error(context, error)
+        finally:
+            self._release_context(context)
+
+    def _execute_parallel_segment(self, contexts):
         rebuild = False
-        if parallel:
-            prepared = {}
-            with ThreadPoolExecutor(max_workers=min(len(parallel), self.settings.ar_concurrency),
-                                    thread_name_prefix="yue2-ar") as executor:
-                futures = {
-                    context["job"]["id"]: executor.submit(
-                        self.pipeline.generate_ar, **context["request"],
-                        cancelled=context["cancelled"], on_token=context["token"],
-                        on_stage=context["stage"])
-                    for context in parallel
-                }
-                # Wait for all AR work so vLLM can batch it before serialized NAR/VAE.
-                for context in parallel:
-                    try:
-                        prepared[context["job"]["id"]] = futures[context["job"]["id"]].result()
-                    except Exception as error:
-                        rebuild |= self._handle_error(context, error)
-                        self._release_context(context)
-            for context in parallel:
-                ar_result = prepared.get(context["job"]["id"])
-                if ar_result is None:
-                    continue
+        prepared = {}
+        with ThreadPoolExecutor(max_workers=min(len(contexts), self.settings.ar_concurrency),
+                                thread_name_prefix="yue2-ar") as executor:
+            futures = {
+                context["job"]["id"]: executor.submit(
+                    self.pipeline.generate_ar, **context["request"],
+                    cancelled=context["cancelled"], on_token=context["token"],
+                    on_stage=context["stage"])
+                for context in contexts
+            }
+            # The segment's AR barrier lets vLLM continuously batch before NAR.
+            for context in contexts:
                 try:
-                    result = self.pipeline.render_ar(
-                        ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
-                    self._save_result(context, result)
+                    prepared[context["job"]["id"]] = futures[context["job"]["id"]].result()
                 except Exception as error:
                     rebuild |= self._handle_error(context, error)
-                finally:
                     self._release_context(context)
-        for context in serial:
-            rebuild |= self._execute_serial(context)
+
+        index = 0
+        supports_nar_batch = all(hasattr(self.pipeline, name) for name in (
+            "nar_batch_admission", "generate_nar_batch", "render_nar"))
+        while index < len(contexts):
+            context = contexts[index]
+            job_id = context["job"]["id"]
+            if job_id not in prepared:
+                index += 1
+                continue
+
+            window = []
+            for candidate in contexts[index:index + self.settings.nar_batch_size]:
+                candidate_id = candidate["job"]["id"]
+                if candidate_id not in prepared:
+                    break
+                window.append(candidate)
+            batch_count = len(window)
+            if not supports_nar_batch:
+                batch_count = 1
+            elif batch_count >= 2:
+                attempts = [batch_count]
+                if batch_count > 2:
+                    attempts.append(2)
+                batch_count = 1
+                for size in attempts:
+                    try:
+                        if self.pipeline.nar_batch_admission(
+                                [prepared[item["job"]["id"]] for item in window[:size]])["allowed"]:
+                            batch_count = size
+                            break
+                    except (MemoryError, ValueError):
+                        continue
+            if batch_count < 2:
+                rebuild |= self._render_prepared(context, prepared[job_id])
+                index += 1
+                continue
+
+            batch = window[:batch_count]
+            try:
+                nar_results = self.pipeline.generate_nar_batch(
+                    [prepared[item["job"]["id"]] for item in batch],
+                    cancelled=[item["cancelled"] for item in batch],
+                    on_stage=[item["stage"] for item in batch])
+            except MemoryError:
+                nar_results = None
+                if batch_count > 2:
+                    batch_count, batch = 2, batch[:2]
+                    try:
+                        nar_results = self.pipeline.generate_nar_batch(
+                            [prepared[item["job"]["id"]] for item in batch],
+                            cancelled=[item["cancelled"] for item in batch],
+                            on_stage=[item["stage"] for item in batch])
+                    except MemoryError:
+                        pass
+                if nar_results is None:
+                    for item in batch:
+                        rebuild |= self._render_prepared(
+                            item, prepared[item["job"]["id"]])
+                    index += batch_count
+                    continue
+            except Exception as error:
+                for item in batch:
+                    rebuild |= self._handle_error(item, error)
+                    self._release_context(item)
+                index += batch_count
+                continue
+            for item, nar_result in zip(batch, nar_results):
+                try:
+                    if isinstance(nar_result, Exception):
+                        raise nar_result
+                    result = self.pipeline.render_nar(
+                        nar_result, cancelled=item["cancelled"], on_stage=item["stage"])
+                    self._save_result(item, result)
+                except Exception as error:
+                    rebuild |= self._handle_error(item, error)
+                finally:
+                    self._release_context(item)
+            index += batch_count
+        return rebuild
+
+    def _execute_claimed(self, claimed):
+        contexts = [self._context(job, request) for job, request in claimed]
+        supports = all(hasattr(self.pipeline, name) for name in (
+            "parallel_ar_eligible", "generate_ar", "render_ar"))
+        rebuild, index = False, 0
+        while index < len(contexts):
+            context = contexts[index]
+            if not supports or not self.pipeline.parallel_ar_eligible(context["request"]):
+                rebuild |= self._execute_serial(context)
+                index += 1
+                continue
+            end = index + 1
+            while (end < len(contexts)
+                   and self.pipeline.parallel_ar_eligible(contexts[end]["request"])):
+                end += 1
+            rebuild |= self._execute_parallel_segment(contexts[index:end])
+            index = end
         return rebuild
 
 

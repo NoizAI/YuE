@@ -84,7 +84,7 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 运维与恢复
 
-- 一个服务进程独占 GPU；兼容请求的 AR 阶段可由 vLLM 并行，NAR/VAE 仍串行。
+- 一个服务进程独占 GPU；兼容请求的 AR 阶段由 vLLM 并行，NAR 可 FIFO 合批，VAE 仍串行。
 - SQLite 保存任务和幂等键；重启继续 queued 任务，原 running 标记 `worker_interrupted`。
 - 同一数据目录使用进程锁，禁止多 Uvicorn worker。多 GPU 使用不同 CUDA_VISIBLE_DEVICES、端口和数据目录。
 - 推理异常会记录服务端日志并重建模型；HTTP 不暴露原始异常中的内部路径。
@@ -93,17 +93,22 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 加速配置
 
-默认服务：`vLLM AR + max_num_seqs=4 + AR concurrency=4 + BF16 + 32 步`。
-vLLM 只执行乐谱和 semantic token 两个 AR 阶段；NAR 声学生成和 VAE 解码仍使用 PyTorch。
+默认服务：`vLLM AR + max_num_seqs=4 + AR concurrency=4 + NAR batch=4 + BF16 + 32 步`。
+vLLM 只执行乐谱和 semantic token 两个 AR 阶段；NAR 声学生成和 VAE 解码使用 PyTorch。
 服务启动时加载一次 vLLM 引擎，并保持到服务退出，不再在每首歌进入 NAR 时销毁。
 队列会一次认领最多 `YUE2_AR_CONCURRENCY` 个兼容请求，并发提交给同一个 vLLM 调度器；
-这些请求完成 AR 后再串行执行 NAR/VAE，避免并发声学阶段争抢显存。
+AR barrier 完成后，服务按原始 FIFO 顺序把连续兼容请求送入 padded NAR batch，随后逐条 VAE decode。
 
 默认并行参数针对当前 32 GB RTX 5090 设置为 4。`YUE2_VLLM_MAX_NUM_SEQS` 控制引擎容量，
 `YUE2_AR_CONCURRENCY` 控制服务同时提交的 AR 请求，后者不能大于前者。提高这两个值会线性增加
 KV 需求；4 路满 24576 上下文理论上约需 10.5 GiB KV。
 `YUE2_AR_BATCH_WAIT_MS=50` 给同时到达的请求一个很短的合批窗口；低延迟优先时可调低，
 吞吐优先时可在压测后适当调高。
+`YUE2_NAR_BATCH_SIZE=4` 控制 NAR 窗口。请求不会按长度排序或分桶，每行保留自己的
+prefix、RoPE 位置、noise/seed 和有效长度；32 步 midpoint ODE 不变，每步仍执行两次 velocity，
+但 QKV/MLP 按 batch 合并。不同长度的 attention 按行裁掉 padding，以避免 masked GQA 退化成
+显式二次方 attention 矩阵。显存准入保留 4 GiB 安全余量，4 路不满足时按 FIFO 降到 2 路，
+2 路仍不满足则逐条执行；运行时分配失败也执行同样的 4→2→1 回退。
 
 服务启动预加载 vLLM、完整 PyTorch MoT、VAE 和短预热，将初始化移出正式任务。
 `YUE2_WARMUP=false` 跳过短预热，但保留 vLLM 引擎预加载。
@@ -114,9 +119,12 @@ NAR 的 acoustic prefix prefill 仍使用 MoT 的 embedding 和 AR 层，因此�
 该比例不是整个 vLLM + MoT + VAE 流水线的硬上限；长请求仍可能被抢占或重计算，必须以真实
 并发压测确认总峰值和安全余量。
 
-GPU 5（RTX 5090）实测常驻空闲显存 17.44 GiB，短歌单条 13.58 秒，4 路长歌 84.96 秒；
-四个压力任务全部成功，NVML 峰值 23.83 GiB，容器无重启。0.30 配置提供 4.45 GiB KV cache
-（41,632 tokens），仍不足以保证 4 路请求同时占满 24,576 上下文。
+GPU 5（RTX 5090）实测 NAR batch=4 稳定通过短歌和长歌各 4 路压力测试，全部成功、容器无重启，
+NVML 峰值 23.83 GiB，保留约 7 GiB 余量。相同常驻基线下，4 路短歌 wall time 从 30.49 秒降到
+24.91 秒（减少 18.3%）；4 路长歌从 84.96 秒降到 83.58 秒（减少 1.6%）。
+batch=2 的对应结果为 35.44 秒和 82.55 秒，因此默认保留稳定的 batch=4：短请求吞吐明显更好，
+长请求与 batch=2 接近。0.30 配置提供约 4.45 GiB vLLM KV cache（41,632 tokens），仍不足以保证
+4 路 AR 请求同时占满 24,576 上下文。
 
 实验选项需要压测、试听后启用：
 

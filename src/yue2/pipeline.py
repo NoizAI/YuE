@@ -82,6 +82,15 @@ class ARResult:
 
 
 @dataclass
+class NARResult:
+    """Completed acoustic flow matching, ready for serial VAE decoding."""
+    ar: ARResult
+    latents: np.ndarray
+    seconds: float
+    batch_size: int = 1
+
+
+@dataclass
 class SongResult:
     audio: np.ndarray
     sample_rate: int
@@ -455,24 +464,96 @@ class YuE2Pipeline:
         """Run the non-AR acoustic stages for a completed AR result."""
         if not isinstance(ar_result, ARResult):
             raise TypeError("Pass the ARResult returned by generate_ar()")
-        semantic = ar_result.semantic
         if on_stage is not None:
             on_stage("synthesis")
         nar_start = time.perf_counter()
-        latents = self.synthesize(semantic, cancelled=cancelled)
-        nar_seconds = time.perf_counter() - nar_start
+        latents = self.synthesize(ar_result.semantic, cancelled=cancelled)
+        nar_result = NARResult(ar_result, latents, time.perf_counter() - nar_start)
+        return self.render_nar(nar_result, cancelled=cancelled, on_stage=on_stage)
+
+    def nar_batch_admission(self, ar_results):
+        """Estimate a FIFO NAR window before allocating padded KV caches."""
+        from .nar import nar_batch_memory_estimate, song_chunks
+        if len(ar_results) < 2 or any(not isinstance(result, ARResult) for result in ar_results):
+            raise ValueError("NAR batch admission requires at least two ARResult objects")
+        model = self._load_model(for_nar=True)
+        songs = [
+            song_chunks(result.semantic.plan.prefix, result.semantic.tokens,
+                        result.semantic.plan.request.seed, self.generation_config.context)
+            for result in ar_results
+        ]
+        return nar_batch_memory_estimate(model, songs)
+
+    def generate_nar_batch(self, ar_results, *, cancelled=None, on_stage=None):
+        """Run padded shared-forward NAR and preserve row order."""
+        from .nar import synthesize_batch
+        ar_results = list(ar_results)
+        if len(ar_results) < 2 or any(not isinstance(result, ARResult) for result in ar_results):
+            raise ValueError("NAR batching requires at least two ARResult objects")
+        callbacks = list(cancelled or [None] * len(ar_results))
+        stages = list(on_stage or [None] * len(ar_results))
+        if len(callbacks) != len(ar_results) or len(stages) != len(ar_results):
+            raise ValueError("NAR batch callbacks must align with results")
+        admission = self.nar_batch_admission(ar_results)
+        if not admission["allowed"]:
+            raise MemoryError("NAR batch does not leave the required GPU memory reserve")
+        values, active = [None] * len(ar_results), []
+        for row, (callback, stage) in enumerate(zip(callbacks, stages)):
+            try:
+                if callback is not None and callback():
+                    raise InterruptedError("Cancelled before acoustic flow matching")
+                if stage is not None:
+                    stage("synthesis")
+            except Exception as error:
+                values[row] = error
+            else:
+                active.append(row)
+        if not active:
+            return values
+        model = self._load_model(for_nar=True)
+        started = time.perf_counter()
+        try:
+            latents = synthesize_batch(
+                model,
+                [ar_results[row].semantic.plan.prefix for row in active],
+                [ar_results[row].semantic.tokens for row in active],
+                [ar_results[row].semantic.plan.request.seed for row in active],
+                steps=self.generation_config.ode_steps, context=self.generation_config.context,
+                cancelled=[callbacks[row] for row in active],
+            )
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR batch exceeded its runtime GPU allocation") from error
+        seconds = time.perf_counter() - started
+        for row, value in zip(active, latents):
+            values[row] = (
+                value if isinstance(value, Exception)
+                else NARResult(ar_results[row], value.detach().float().cpu().numpy(),
+                               seconds, len(active))
+            )
+        return values
+
+    def render_nar(self, nar_result, *, cancelled=None, on_stage=None):
+        """Decode one completed NAR result; VAE intentionally remains serial."""
+        if not isinstance(nar_result, NARResult):
+            raise TypeError("Pass the NARResult returned by the acoustic stage")
+        ar_result, latents = nar_result.ar, nar_result.latents
+        semantic = ar_result.semantic
         if cancelled is not None and cancelled():
             raise InterruptedError("Cancelled before VAE")
         vae_start = time.perf_counter()
         if on_stage is not None:
             on_stage("decode")
         audio = self.decode(latents, cancelled=cancelled) if cancelled is not None else self.decode(latents)
-        timing = {"abc": semantic.plan.timing, "semantic": semantic.timing, "nar_seconds": nar_seconds,
+        timing = {"abc": semantic.plan.timing, "semantic": semantic.timing, "nar_seconds": nar_result.seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
                   "e2e_seconds": time.perf_counter() - ar_result.started_at}
+        config = dict(ar_result.config)
+        config.update(nar_execution="batched_padded" if nar_result.batch_size > 1 else "sequential",
+                      nar_batch_size=nar_result.batch_size, vae_execution="sequential")
         Progress(enabled=self.progress).complete(len(audio) / 48000, timing["e2e_seconds"],
                                                 truncated=semantic.plan.truncated or semantic.truncated)
-        result = SongResult(audio, 48000, semantic, latents, ar_result.config, self.weights,
+        result = SongResult(audio, 48000, semantic, latents, config, self.weights,
                             timing, ar_result.request_identity)
         return result
 

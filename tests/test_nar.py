@@ -118,6 +118,77 @@ def test_default_is_32_midpoint_steps(model):
     assert velocity.call_args_list[0].args[1] == 20.0
 
 
+def test_batched_cached_velocity_matches_serial_unequal_rows(model):
+    chunks = [
+        nar.Chunk([2, 3, 4, 5], torch.randn(
+            (3, 64), generator=torch.Generator().manual_seed(51))),
+        nar.Chunk([2, 3, 4, 5, 6, 7], torch.randn(
+            (5, 64), generator=torch.Generator().manual_seed(52)), nar_cond_end=3),
+    ]
+    engine = nar.BatchedCachedNAR(model, chunks, query_chunk_size=3)
+    state = nar._pad_first_dim([chunk.noise for chunk in chunks])
+    actual = engine.velocity(state, -1.7)
+    for row, chunk in enumerate(chunks):
+        serial = nar.CachedNAR(model, chunk, query_chunk_size=3)
+        expected = serial.velocity(chunk.noise, -1.7)
+        serial.close()
+        torch.testing.assert_close(actual[row, :len(chunk.noise)], expected,
+                                   atol=2e-6, rtol=3e-5)
+    assert torch.count_nonzero(actual[0, len(chunks[0].noise):]) == 0
+    engine.close()
+
+
+def test_batched_default_uses_two_shared_forwards_per_step(model):
+    chunks = [nar.Chunk([2, 3], torch.zeros((length, 64))) for length in (2, 3)]
+    engine = nar.BatchedCachedNAR(model, chunks)
+    shape = (2, 3, 64)
+    with patch.object(engine, "velocity", return_value=torch.ones(shape)) as velocity:
+        results = engine.solve()
+    assert velocity.call_count == 64
+    assert [tuple(result.shape) for result in results] == [(2, 64), (3, 64)]
+    assert all(torch.equal(result, -torch.ones_like(result)) for result in results)
+    engine.close()
+
+
+def test_synthesize_batch_matches_serial_for_unequal_multichunk_songs(model, monkeypatch):
+    monkeypatch.setattr(nar, "CODEC_OFFSET", 8)
+    monkeypatch.setattr(nar, "MUSIC_END", 7)
+    prefixes = [[2, 3], [2, 3, 4]]
+    codecs = [[1] * 11, [2] * 7]
+    seeds = [42, 81]
+    expected = [
+        nar.synthesize(model, prefix, codec, seed, steps=2, context=15)
+        for prefix, codec, seed in zip(prefixes, codecs, seeds)
+    ]
+    actual = nar.synthesize_batch(
+        model, prefixes, codecs, seeds, steps=2, context=15)
+    for batch_row, serial in zip(actual, expected):
+        assert not isinstance(batch_row, Exception)
+        torch.testing.assert_close(batch_row, serial, atol=2e-6, rtol=3e-5)
+
+
+def test_synthesize_batch_cancels_one_row_without_stopping_peer(model, monkeypatch):
+    monkeypatch.setattr(nar, "CODEC_OFFSET", 8)
+    monkeypatch.setattr(nar, "MUSIC_END", 7)
+    decisions = iter([False, False, True])
+    actual = nar.synthesize_batch(
+        model, [[2, 3], [2, 3]], [[1, 2], [1, 2]], [42, 81], steps=2,
+        cancelled=[lambda: False, lambda: next(decisions)])
+    assert isinstance(actual[1], InterruptedError)
+    assert isinstance(actual[0], torch.Tensor) and tuple(actual[0].shape) == (2, 64)
+
+
+def test_nar_batch_memory_estimate_is_descriptive_on_cpu(model):
+    songs = [
+        [nar.Chunk([2, 3], torch.zeros((2, 64)))],
+        [nar.Chunk([2, 3, 4], torch.zeros((3, 64)))],
+    ]
+    estimate = nar.nar_batch_memory_estimate(model, songs)
+    assert estimate["allowed"] and estimate["available_bytes"] is None
+    assert estimate["batch_size"] == 2 and estimate["max_visible_tokens"] == 3
+    assert estimate["required_bytes"] > estimate["cache_bytes"] > 0
+
+
 def test_midpoint_progress_counts_complete_steps_without_changing_output(model):
     noise = torch.randn((3, 64), generator=torch.Generator().manual_seed(391))
     engine = nar.CachedNAR(model, nar.Chunk([2, 3], noise))
