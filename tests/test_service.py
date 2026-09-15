@@ -498,5 +498,5 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)
-    with pytest.raises(ValidationError):
-        Settings(api_key=KEY, ar_concurrency=2, nar_batch_size=3)
+    compatible = Settings(api_key=KEY, ar_concurrency=2, vllm_max_num_seqs=2)
+    assert compatible.nar_batch_size == 4

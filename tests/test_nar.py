@@ -189,6 +189,24 @@ def test_nar_batch_memory_estimate_is_descriptive_on_cpu(model):
     assert estimate["required_bytes"] > estimate["cache_bytes"] > 0
 
 
+def test_nar_batch_admission_respects_cuda_process_limit(model, monkeypatch):
+    parameter = SimpleNamespace(device=torch.device("cuda"), element_size=lambda: 2)
+    fake = SimpleNamespace(config=model.config, parameters=lambda: iter([parameter]))
+    gib = 2**30
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (20 * gib, 32 * gib))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 14 * gib)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: 14 * gib)
+    monkeypatch.setattr(torch.cuda, "get_per_process_memory_fraction", lambda device: .5)
+    songs = [
+        [nar.Chunk([2, 3], torch.zeros((2, 64)))],
+        [nar.Chunk([2, 3, 4], torch.zeros((3, 64)))],
+    ]
+    estimate = nar.nar_batch_memory_estimate(fake, songs)
+    assert estimate["process_limit_bytes"] == 16 * gib
+    assert estimate["available_bytes"] == gib
+    assert not estimate["allowed"]
+
+
 def test_midpoint_progress_counts_complete_steps_without_changing_output(model):
     noise = torch.randn((3, 64), generator=torch.Generator().manual_seed(391))
     engine = nar.CachedNAR(model, nar.Chunk([2, 3], noise))

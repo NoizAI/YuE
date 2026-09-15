@@ -341,7 +341,7 @@ class BatchedCachedNAR:
 
 
 def nar_batch_memory_estimate(model, songs, reserve_gib=4):
-    """Conservative padded-cache admission for one chunk per FIFO song."""
+    """Padded-cache admission bounded by physical and process memory limits."""
     chunks = [chunk for song in songs for chunk in song]
     batch = len(songs)
     if not chunks or batch < 1:
@@ -366,11 +366,17 @@ def nar_batch_memory_estimate(model, songs, reserve_gib=4):
     device = next(model.parameters()).device
     if device.type != "cuda":
         return dict(result, available_bytes=None, allowed=True)
-    free, _ = torch.cuda.mem_get_info(device)
-    reclaimable = max(torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device), 0)
-    available = free + reclaimable
-    return dict(result, available_bytes=available,
-                allowed=required + result["reserve_bytes"] <= available)
+    free, total = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    reclaimable = max(torch.cuda.memory_reserved(device) - allocated, 0)
+    fraction = torch.cuda.get_per_process_memory_fraction(device)
+    process_available = total * fraction - allocated - 2**30
+    physical_available = free + reclaimable - result["reserve_bytes"]
+    available = min(process_available, physical_available)
+    return dict(result, available_bytes=available, free_bytes=free,
+                allocated_bytes=allocated, reclaimable_cache_bytes=reclaimable,
+                process_limit_bytes=int(total * fraction),
+                allowed=required <= available)
 
 
 @torch.inference_mode()

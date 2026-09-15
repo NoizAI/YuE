@@ -59,8 +59,6 @@ class Settings(BaseModel):
             raise ValueError("The current vLLM adapter does not support FP8")
         if self.backend == "vllm" and self.ar_concurrency > self.vllm_max_num_seqs:
             raise ValueError("YUE2_AR_CONCURRENCY cannot exceed YUE2_VLLM_MAX_NUM_SEQS")
-        if self.backend == "vllm" and self.nar_batch_size > self.ar_concurrency:
-            raise ValueError("YUE2_NAR_BATCH_SIZE cannot exceed YUE2_AR_CONCURRENCY")
         return self
 
     @classmethod
