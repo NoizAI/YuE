@@ -475,15 +475,19 @@ class YuE2Pipeline:
         if on_stage is not None:
             on_stage("synthesis")
         nar_start = time.perf_counter()
-        latents = self.synthesize(ar_result.semantic, cancelled=cancelled)
+        try:
+            latents = self.synthesize(ar_result.semantic, cancelled=cancelled)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR exceeded its runtime GPU allocation") from error
         nar_result = NARResult(ar_result, latents, time.perf_counter() - nar_start)
         return self.render_nar(nar_result, cancelled=cancelled, on_stage=on_stage)
 
     def nar_batch_admission(self, ar_results):
         """Estimate a FIFO NAR window before allocating padded KV caches."""
         from .nar import nar_batch_memory_estimate, song_chunks
-        if len(ar_results) < 2 or any(not isinstance(result, ARResult) for result in ar_results):
-            raise ValueError("NAR batch admission requires at least two ARResult objects")
+        if not ar_results or any(not isinstance(result, ARResult) for result in ar_results):
+            raise ValueError("NAR admission requires at least one ARResult")
         model = self._load_model(for_nar=True)
         songs = [
             song_chunks(result.semantic.plan.prefix, result.semantic.tokens,
@@ -552,7 +556,12 @@ class YuE2Pipeline:
         vae_start = time.perf_counter()
         if on_stage is not None:
             on_stage("decode")
-        audio = self.decode(latents, cancelled=cancelled) if cancelled is not None else self.decode(latents)
+        try:
+            audio = self.decode(
+                latents, cancelled=cancelled) if cancelled is not None else self.decode(latents)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("VAE exceeded its runtime GPU allocation") from error
         timing = {"abc": semantic.plan.timing, "semantic": semantic.timing, "nar_seconds": nar_result.seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
                   "e2e_seconds": time.perf_counter() - ar_result.started_at}

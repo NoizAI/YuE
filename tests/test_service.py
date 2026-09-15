@@ -310,6 +310,149 @@ def test_worker_batches_vllm_ar_and_serializes_render(tmp_path):
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
 
 
+@pytest.mark.parametrize("mode", ["overlap", "admission", "runtime_oom"])
+def test_worker_overlaps_next_ar_wave_or_waits_on_pressure(tmp_path, mode):
+    class OverlapPipeline:
+        def __init__(self):
+            self.second_ar_started = threading.Event()
+            self.release_second_ar = threading.Event()
+            self.overlap_seen = threading.Event()
+            self.runtime_oom_seen = False
+            self.saved = []
+
+        def preload(self):
+            pass
+
+        def close(self):
+            self.release_second_ar.set()
+
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, **kwargs):
+            if seed >= 3:
+                self.second_ar_started.set()
+                assert self.release_second_ar.wait(2)
+            return seed
+
+        def nar_batch_admission(self, results):
+            if results == [1, 2]:
+                assert self.second_ar_started.wait(2)
+                if mode == "admission" and not self.release_second_ar.is_set():
+                    self.release_second_ar.set()
+                    return {"allowed": False}
+            return {"allowed": True}
+
+        def generate_nar_batch(self, results, **kwargs):
+            if results == [1, 2] and mode == "overlap":
+                self.overlap_seen.set()
+                self.release_second_ar.set()
+            if results == [1, 2] and mode == "runtime_oom" and not self.runtime_oom_seen:
+                self.runtime_oom_seen = True
+                self.release_second_ar.set()
+                raise MemoryError("simulated overlap pressure")
+            return list(results)
+
+        def render_nar(self, seed, **kwargs):
+            return self.result(seed)
+
+        def render_ar(self, seed, **kwargs):
+            return self.result(seed)
+
+        def result(self, seed):
+            def save(output):
+                self.saved.append(seed)
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
+                        vllm_max_num_seqs=2, nar_batch_size=2, ar_batch_wait_ms=0)
+    pipe = OverlapPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    jobs = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in (1, 2, 3, 4)]
+    worker.start()
+    try:
+        wait_for(lambda: all(worker.store.get(job["id"])["status"] in
+                            {"succeeded", "failed", "cancelled", "truncated"} for job in jobs))
+        assert [worker.store.get(job["id"])["status"] for job in jobs] == ["succeeded"] * 4
+        assert pipe.saved == [1, 2, 3, 4]
+        first = worker.store.get(jobs[0]["id"])["result"]["configuration"]["service_pipeline"]
+        if mode in {"admission", "runtime_oom"}:
+            assert first["pressure_waited"]
+        else:
+            assert pipe.overlap_seen.is_set()
+    finally:
+        worker.stop()
+
+
+def test_overlap_rebuild_waits_for_inflight_ar_and_keeps_next_wave(tmp_path):
+    class RebuildPipeline:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.second_ar_started = threading.Event()
+            self.active_ar = self.closes = 0
+            self.fail_acoustic = True
+
+        def preload(self):
+            pass
+
+        def close(self):
+            with self.lock:
+                assert self.active_ar == 0
+                self.closes += 1
+
+        def parallel_ar_eligible(self, request):
+            return True
+
+        def generate_ar(self, *, seed, **kwargs):
+            if seed >= 3:
+                with self.lock:
+                    self.active_ar += 1
+                self.second_ar_started.set()
+                time.sleep(.05)
+                with self.lock:
+                    self.active_ar -= 1
+            return seed
+
+        def nar_batch_admission(self, results):
+            if results == [1, 2]:
+                assert self.second_ar_started.wait(2)
+            return {"allowed": True}
+
+        def generate_nar_batch(self, results, **kwargs):
+            if results == [1, 2] and self.fail_acoustic:
+                self.fail_acoustic = False
+                raise RuntimeError("simulated acoustic failure")
+            return list(results)
+
+        def render_nar(self, seed, **kwargs):
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio")
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+        def render_ar(self, seed, **kwargs):
+            return self.render_nar(seed)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
+                        vllm_max_num_seqs=2, ar_batch_wait_ms=0)
+    pipe = RebuildPipeline()
+    worker = JobWorker(settings, lambda _: pipe)
+    jobs = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in (1, 2, 3, 4)]
+    worker.start()
+    try:
+        wait_for(lambda: all(worker.store.get(job["id"])["status"] in
+                            {"succeeded", "failed", "cancelled", "truncated"} for job in jobs))
+        assert [worker.store.get(job["id"])["status"] for job in jobs] == [
+            "failed", "failed", "succeeded", "succeeded"]
+        assert pipe.closes >= 1
+    finally:
+        worker.stop()
+
+
 def test_worker_batches_nar_in_fifo_windows_and_keeps_vae_serial(tmp_path):
     class BatchedPipeline:
         def __init__(self):
@@ -361,10 +504,11 @@ def test_worker_batches_nar_in_fifo_windows_and_keeps_vae_serial(tmp_path):
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
 
 
-def test_worker_retries_runtime_nar_oom_as_two_fifo_pairs(tmp_path):
+def test_worker_falls_back_to_single_rows_after_batch_two_oom(tmp_path):
     class RuntimeFallbackPipeline:
         def __init__(self):
             self.calls = []
+            self.serial = []
 
         def parallel_ar_eligible(self, request):
             return True
@@ -377,7 +521,7 @@ def test_worker_retries_runtime_nar_oom_as_two_fifo_pairs(tmp_path):
 
         def generate_nar_batch(self, results, **kwargs):
             self.calls.append(list(results))
-            if len(results) == 4:
+            if results == [0, 1]:
                 raise MemoryError("simulated runtime pressure")
             return list(results)
 
@@ -389,7 +533,8 @@ def test_worker_retries_runtime_nar_oom_as_two_fifo_pairs(tmp_path):
             return SimpleNamespace(abc=None, config={}, save_artifacts=save)
 
         def render_ar(self, seed, **kwargs):
-            raise AssertionError(f"Unexpected single-row fallback for {seed}")
+            self.serial.append(seed)
+            return self.render_nar(seed)
 
     settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False)
     pipe = RuntimeFallbackPipeline()
@@ -397,7 +542,8 @@ def test_worker_retries_runtime_nar_oom_as_two_fifo_pairs(tmp_path):
     worker.pipeline = pipe
     jobs = [worker.store.submit({**REQUEST, "seed": seed}, 4)[0] for seed in range(4)]
     assert worker._execute_claimed(worker.store.claim_many(4)) is False
-    assert pipe.calls == [[0, 1, 2, 3], [0, 1], [2, 3]]
+    assert pipe.calls == [[0, 1], [2, 3]]
+    assert pipe.serial == [0, 1]
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in jobs)
 
 
@@ -462,7 +608,7 @@ def test_worker_does_not_reorder_fifo_across_ineligible_job(tmp_path):
                         "audio_seconds": 1, "sample_rate": 48000, "timing": {"seed": seed}}
             return SimpleNamespace(abc=None, config={}, save_artifacts=save)
 
-    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, nar_batch_size=4)
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, nar_batch_size=2)
     pipe = MixedPipeline()
     worker = JobWorker(settings, lambda _: pipe)
     worker.pipeline = pipe
@@ -494,12 +640,14 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     assert settings.ar_concurrency == settings.vllm_max_num_seqs == 4
     assert settings.vllm_gpu_memory_utilization == .3
     assert settings.vllm_max_num_batched_tokens == 8192
-    assert settings.nar_batch_size == 4
+    assert settings.nar_batch_size == 2 and settings.ar_nar_overlap
     assert settings.ar_batch_wait_ms == 50
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_max_num_batched_tokens=24577)
+    with pytest.raises(ValidationError):
+        Settings(api_key=KEY, nar_batch_size=3)
     compatible = Settings(api_key=KEY, ar_concurrency=2, vllm_max_num_seqs=2)
-    assert compatible.nar_batch_size == 4
+    assert compatible.nar_batch_size == 2

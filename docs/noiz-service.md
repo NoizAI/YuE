@@ -93,11 +93,12 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 
 ## 加速配置
 
-默认服务：`vLLM AR + max_num_seqs=4 + AR concurrency=4 + NAR batch=4 + BF16 + 32 步`。
+默认服务：`vLLM AR + max_num_seqs=4 + AR concurrency=4 + NAR batch=2 + AR/NAR overlap + BF16 + 32 步`。
 vLLM 只执行乐谱和 semantic token 两个 AR 阶段；NAR 声学生成和 VAE 解码使用 PyTorch。
 服务启动时加载一次 vLLM 引擎，并保持到服务退出，不再在每首歌进入 NAR 时销毁。
-队列会一次认领最多 `YUE2_AR_CONCURRENCY` 个兼容请求，并发提交给同一个 vLLM 调度器；
-AR barrier 完成后，服务按原始 FIFO 顺序把连续兼容请求送入 padded NAR batch，随后逐条 VAE decode。
+服务最多提前准备一波 AR：当前波按原始 FIFO 顺序执行 padded NAR batch 和逐条 VAE decode 时，
+后台可认领下一波并提交到同一个 vLLM 调度器。prepared 结果不能越过队头解码或保存。
+`cot=off`、CFG fallback 和非 vLLM 请求仍是独占 barrier，不允许后续任务跨越。
 
 默认并行参数针对当前 32 GB RTX 5090 设置为 4。`YUE2_VLLM_MAX_NUM_SEQS` 控制引擎容量，
 `YUE2_AR_CONCURRENCY` 控制服务同时提交的 AR 请求，后者不能大于前者。提高这两个值会线性增加
@@ -106,11 +107,12 @@ KV 需求；4 路满 24576 上下文理论上约需 10.5 GiB KV。
 仍保持开启；它提高长 prompt 的 prefill 上限，但会增加引擎 profiling 的峰值和显存需求。
 `YUE2_AR_BATCH_WAIT_MS=50` 给同时到达的请求一个很短的合批窗口；低延迟优先时可调低，
 吞吐优先时可在压测后适当调高。
-`YUE2_NAR_BATCH_SIZE=4` 控制 NAR 窗口。请求不会按长度排序或分桶，每行保留自己的
+`YUE2_AR_NAR_OVERLAP=true` 启用跨请求流水线；设为 `false` 可恢复原 AR barrier 行为。
+`YUE2_NAR_BATCH_SIZE=2` 控制 NAR 窗口且当前最大只能设为 2。请求不会按长度排序或分桶，每行保留自己的
 prefix、RoPE 位置、noise/seed 和有效长度；32 步 midpoint ODE 不变，每步仍执行两次 velocity，
 但 QKV/MLP 按 batch 合并。不同长度的 attention 按行裁掉 padding，以避免 masked GQA 退化成
-显式二次方 attention 矩阵。显存准入保留 4 GiB 安全余量，4 路不满足时按 FIFO 降到 2 路，
-2 路仍不满足则逐条执行；运行时分配失败也执行同样的 4→2→1 回退。
+显式二次方 attention 矩阵。显存准入保留 4 GiB 安全余量；2 路不满足或首次运行时 OOM 时，
+服务暂停新 AR、等待在途 AR 释放运行时资源后重试，仍不满足才按 FIFO 降为逐条执行。
 
 服务启动预加载 vLLM、完整 PyTorch MoT、VAE 和短预热，将初始化移出正式任务。
 `YUE2_WARMUP=false` 跳过短预热，但保留 vLLM 引擎预加载。
@@ -121,12 +123,12 @@ NAR 的 acoustic prefix prefill 仍使用 MoT 的 embedding 和 AR 层，因此�
 该比例不是整个 vLLM + MoT + VAE 流水线的硬上限；长请求仍可能被抢占或重计算，必须以真实
 并发压测确认总峰值和安全余量。
 
-GPU 5（RTX 5090）实测 NAR batch=4 稳定通过短歌和长歌各 4 路压力测试，全部成功、容器无重启，
-NVML 峰值 23.83 GiB，保留约 7 GiB 余量。相同常驻基线下，4 路短歌 wall time 从 30.49 秒降到
-24.91 秒（减少 18.3%）；4 路长歌从 84.96 秒降到 83.58 秒（减少 1.6%）。
-batch=2 的对应结果为 35.44 秒和 82.55 秒，因此默认保留稳定的 batch=4：短请求吞吐明显更好，
-长请求与 batch=2 接近。0.30 配置提供约 4.45 GiB vLLM KV cache（41,632 tokens），仍不足以保证
-4 路 AR 请求同时占满 24,576 上下文。
+GPU 5（RTX 5090、未启用 NVIDIA MPS）以 NAR batch=2 各压测 8 路短歌和长歌，barrier 与 overlap
+均为 16/16 成功、无 OOM，NVML 峰值分别为 24.22/24.22 GiB。短歌 wall time 为
+53.06/53.66 秒，长歌为 163.33/166.68 秒；流水线确实发生重叠，但该环境主要体现为两个 CUDA
+context 争用，吞吐分别下降 1.1% 和 2.0%。按请求默认保留 overlap 支持，可通过配置关闭以获得
+该机器当前更高的吞吐。0.30 配置在 `max_num_batched_tokens=8192` 下提供约 4.4 GiB vLLM KV cache
+（41,200 tokens），仍不足以保证 4 路 AR 请求同时占满 24,576 上下文。
 
 实验选项需要压测、试听后启用：
 

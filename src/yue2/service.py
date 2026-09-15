@@ -45,7 +45,8 @@ class Settings(BaseModel):
     vllm_max_num_seqs: int = Field(default=4, ge=1, le=16)
     vllm_max_num_batched_tokens: int = Field(default=8192, ge=1, le=24576)
     vllm_gpu_memory_utilization: float = Field(default=.3, gt=0, le=.9, allow_inf_nan=False)
-    nar_batch_size: int = Field(default=4, ge=1, le=16)
+    nar_batch_size: int = Field(default=2, ge=1, le=2)
+    ar_nar_overlap: bool = True
     ar_batch_wait_ms: int = Field(default=50, ge=0, le=1000)
     ode_steps: int = Field(default=32, ge=1, le=64)
     vae_core_frames: int = Field(default=1024, ge=64, le=4096)
@@ -105,6 +106,51 @@ def build_pipeline(settings):
         generation_config=GenerationConfig(ode_steps=settings.ode_steps), progress=False)
 
 
+class _AROverlapControl:
+    """Coordinate one prefetching AR wave with the parent acoustic lane."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.paused = False
+        self.ar_active = False
+
+    def begin_ar(self, stop_event):
+        with self.condition:
+            while self.paused and not stop_event.is_set():
+                self.condition.wait(.1)
+            if stop_event.is_set():
+                return False
+            self.ar_active = True
+            self.condition.notify_all()
+            return True
+
+    def wait_resumed(self, stop_event):
+        with self.condition:
+            while self.paused and not stop_event.is_set():
+                self.condition.wait(.1)
+            return not stop_event.is_set()
+
+    def finish_ar(self):
+        with self.condition:
+            self.ar_active = False
+            self.condition.notify_all()
+
+    def pause_and_wait(self):
+        with self.condition:
+            self.paused = True
+            while self.ar_active:
+                self.condition.wait(.1)
+
+    def resume(self):
+        with self.condition:
+            self.paused = False
+            self.condition.notify_all()
+
+    def active(self):
+        with self.condition:
+            return self.ar_active
+
+
 class JobWorker:
     def __init__(self, settings, factory):
         self.settings, self.factory = settings, factory
@@ -119,6 +165,7 @@ class JobWorker:
         self.pipeline = None
         self.thread = None
         self.lock_file = None
+        self.overlap_control = None
 
     def start(self):
         self.lock_file = (self.root / "worker.lock").open("a+")
@@ -143,6 +190,8 @@ class JobWorker:
         with self.lock:
             for cancel_event in self.active.values():
                 cancel_event.set()
+        if self.overlap_control is not None:
+            self.overlap_control.resume()
         self.wake.set()
         if self.thread is not None:
             self.thread.join()  # cooperative cancellation; supervisor may force-stop a stuck CUDA driver
@@ -171,25 +220,116 @@ class JobWorker:
                           cancelled=self.stop_event.is_set)
         self.ready = not self.stop_event.is_set()
 
+    def _reload_pipeline(self):
+        self.ready = False
+        self.pipeline.close()
+        self.pipeline = None
+        gc.collect()
+        self._load()
+
+    def _claim_next(self, control=None):
+        while not self.stop_event.is_set():
+            if control is not None and not control.wait_resumed(self.stop_event):
+                return None
+            self.wake.clear()
+            if self.settings.backend == "vllm" and self.settings.ar_concurrency > 1:
+                # Briefly coalesce simultaneous submissions into one vLLM scheduling wave.
+                if self.stop_event.wait(self.settings.ar_batch_wait_ms / 1000):
+                    return None
+            claimed = self.store.claim_many(self.settings.ar_concurrency)
+            if claimed:
+                return claimed
+            self.wake.wait(0.5)
+        return None
+
+    def _claim_and_prepare(self, control):
+        claimed = self._claim_next(control)
+        if claimed is None:
+            return None
+        contexts = [self._context(job, request) for job, request in claimed]
+        supports = all(hasattr(self.pipeline, name) for name in (
+            "parallel_ar_eligible", "generate_ar", "render_ar"))
+        if not supports or not all(
+                self.pipeline.parallel_ar_eligible(context["request"]) for context in contexts):
+            return {"kind": "exclusive", "contexts": contexts}
+        if not control.begin_ar(self.stop_event):
+            return {"kind": "exclusive", "contexts": contexts}
+        try:
+            prepared, rebuild = self._prepare_parallel_segment(contexts)
+            return {"kind": "prepared", "contexts": contexts,
+                    "prepared": prepared, "rebuild": rebuild}
+        finally:
+            control.finish_ar()
+
+    def _cancel_wave(self, wave):
+        if wave is None:
+            return
+        for context in wave["contexts"]:
+            with self.lock:
+                active = context["job"]["id"] in self.active
+            if active:
+                self._handle_error(context, InterruptedError("Worker stopped"))
+                self._release_context(context)
+
+    def _run_barrier(self):
+        while not self.stop_event.is_set():
+            claimed = self._claim_next()
+            if claimed is None:
+                return
+            rebuild = self._execute_claimed(claimed)
+            if rebuild and not self.stop_event.is_set():
+                self._reload_pipeline()
+
+    def _run_overlap(self):
+        control = self.overlap_control = _AROverlapControl()
+        future = None
+        try:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="yue2-ar-prefetch") as prefetch:
+                future = prefetch.submit(self._claim_and_prepare, control)
+                while not self.stop_event.is_set():
+                    wave = future.result()
+                    future = None
+                    if wave is None:
+                        break
+                    if wave["kind"] == "exclusive":
+                        rebuild = self._execute_contexts(wave["contexts"])
+                        if rebuild and not self.stop_event.is_set():
+                            self._reload_pipeline()
+                        if not self.stop_event.is_set():
+                            future = prefetch.submit(self._claim_and_prepare, control)
+                        continue
+
+                    # Do not prefetch through a known-bad AR wave before rebuilding.
+                    if wave["rebuild"]:
+                        rebuild = self._render_prepared_segment(
+                            wave["contexts"], wave["prepared"], None)
+                        if (rebuild or wave["rebuild"]) and not self.stop_event.is_set():
+                            self._reload_pipeline()
+                        if not self.stop_event.is_set():
+                            future = prefetch.submit(self._claim_and_prepare, control)
+                        continue
+
+                    future = prefetch.submit(self._claim_and_prepare, control)
+                    rebuild = self._render_prepared_segment(
+                        wave["contexts"], wave["prepared"], control)
+                    if rebuild and not self.stop_event.is_set():
+                        control.pause_and_wait()
+                        self._reload_pipeline()
+                    control.resume()
+                if future is not None:
+                    self._cancel_wave(future.result())
+        finally:
+            control.resume()
+            self.overlap_control = None
+
     def _run(self):
         try:
             self._load()
-            while not self.stop_event.is_set():
-                self.wake.clear()
-                if self.settings.backend == "vllm" and self.settings.ar_concurrency > 1:
-                    # Briefly coalesce simultaneous submissions into one vLLM scheduling wave.
-                    self.stop_event.wait(self.settings.ar_batch_wait_ms / 1000)
-                claimed = self.store.claim_many(self.settings.ar_concurrency)
-                if not claimed:
-                    self.wake.wait(0.5)
-                    continue
-                rebuild = self._execute_claimed(claimed)
-                if rebuild and not self.stop_event.is_set():
-                    self.ready = False
-                    self.pipeline.close()
-                    self.pipeline = None
-                    gc.collect()
-                    self._load()
+            if (self.settings.ar_nar_overlap and self.settings.backend == "vllm"
+                    and self.settings.ar_concurrency > 1):
+                self._run_overlap()
+            else:
+                self._run_barrier()
         except Exception:
             if not self.stop_event.is_set():
                 self.startup_error = True
@@ -209,6 +349,9 @@ class JobWorker:
             "job": job, "request": request, "cancel_event": cancel_event,
             "deadline": time.monotonic() + self.settings.task_timeout_seconds,
             "counts": {"abc": 0, "semantic": 0}, "last_report": 0.0,
+            "pipeline": {"ar_nar_overlap": bool(self.settings.ar_nar_overlap),
+                         "ar_active_at_acoustic_start": False,
+                         "pressure_waited": False},
         }
 
         def cancelled():
@@ -235,6 +378,8 @@ class JobWorker:
         context["stage"]("saving")
         output = self.root / "artifacts" / job_id
         output.mkdir(parents=True, exist_ok=False)
+        if isinstance(getattr(result, "config", None), dict):
+            result.config["service_pipeline"] = dict(context["pipeline"])
         saved = result.save_artifacts(output)
         if context["cancelled"]():
             raise InterruptedError("Cancelled after saving")
@@ -285,18 +430,20 @@ class JobWorker:
         finally:
             self._release_context(context)
 
-    def _render_prepared(self, context, ar_result):
-        try:
-            result = self.pipeline.render_ar(
-                ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
-            self._save_result(context, result)
+    def _pause_for_pressure(self, control, contexts):
+        if control is None:
             return False
-        except Exception as error:
-            return self._handle_error(context, error)
-        finally:
-            self._release_context(context)
+        for context in contexts:
+            context["pipeline"]["pressure_waited"] = True
+        control.pause_and_wait()
+        return True
 
-    def _execute_parallel_segment(self, contexts):
+    def _mark_acoustic_start(self, control, contexts):
+        active = control is not None and control.active()
+        for context in contexts:
+            context["pipeline"]["ar_active_at_acoustic_start"] |= active
+
+    def _prepare_parallel_segment(self, contexts):
         rebuild = False
         prepared = {}
         with ThreadPoolExecutor(max_workers=min(len(contexts), self.settings.ar_concurrency),
@@ -315,7 +462,51 @@ class JobWorker:
                 except Exception as error:
                     rebuild |= self._handle_error(context, error)
                     self._release_context(context)
+        return prepared, rebuild
 
+    def _render_prepared(self, context, ar_result, control=None):
+        self._mark_acoustic_start(control, [context])
+        try:
+            for attempt in range(2 if control is not None else 1):
+                try:
+                    result = self.pipeline.render_ar(
+                        ar_result, cancelled=context["cancelled"], on_stage=context["stage"])
+                    self._save_result(context, result)
+                    return False
+                except MemoryError:
+                    if attempt == 0 and self._pause_for_pressure(control, [context]):
+                        continue
+                    raise
+        except Exception as error:
+            return self._handle_error(context, error)
+        finally:
+            self._release_context(context)
+
+    def _render_nar_result(self, context, nar_result, control=None):
+        try:
+            for attempt in range(2 if control is not None else 1):
+                try:
+                    result = self.pipeline.render_nar(
+                        nar_result, cancelled=context["cancelled"], on_stage=context["stage"])
+                    self._save_result(context, result)
+                    return False
+                except MemoryError:
+                    if attempt == 0 and self._pause_for_pressure(control, [context]):
+                        continue
+                    raise
+        except Exception as error:
+            return self._handle_error(context, error)
+        finally:
+            self._release_context(context)
+
+    def _nar_admitted(self, ar_results):
+        try:
+            return self.pipeline.nar_batch_admission(ar_results)["allowed"]
+        except (MemoryError, ValueError):
+            return False
+
+    def _render_prepared_segment(self, contexts, prepared, control=None):
+        rebuild = False
         index = 0
         supports_nar_batch = all(hasattr(self.pipeline, name) for name in (
             "nar_batch_admission", "generate_nar_batch", "render_nar"))
@@ -336,46 +527,40 @@ class JobWorker:
             if not supports_nar_batch:
                 batch_count = 1
             elif batch_count >= 2:
-                attempts = [batch_count]
-                if batch_count > 2:
-                    attempts.append(2)
-                batch_count = 1
-                for size in attempts:
-                    try:
-                        if self.pipeline.nar_batch_admission(
-                                [prepared[item["job"]["id"]] for item in window[:size]])["allowed"]:
-                            batch_count = size
-                            break
-                    except (MemoryError, ValueError):
-                        continue
+                results = [prepared[item["job"]["id"]] for item in window[:batch_count]]
+                self._mark_acoustic_start(control, window[:batch_count])
+                if not self._nar_admitted(results):
+                    self._pause_for_pressure(control, window[:batch_count])
+                if not self._nar_admitted(results):
+                    batch_count = 1
             if batch_count < 2:
-                rebuild |= self._render_prepared(context, prepared[job_id])
+                if supports_nar_batch and control is not None:
+                    self._mark_acoustic_start(control, [context])
+                    if not self._nar_admitted([prepared[job_id]]):
+                        self._pause_for_pressure(control, [context])
+                rebuild |= self._render_prepared(context, prepared[job_id], control)
                 index += 1
                 continue
 
             batch = window[:batch_count]
+            batch_args = {
+                "cancelled": [item["cancelled"] for item in batch],
+                "on_stage": [item["stage"] for item in batch],
+            }
             try:
-                nar_results = self.pipeline.generate_nar_batch(
-                    [prepared[item["job"]["id"]] for item in batch],
-                    cancelled=[item["cancelled"] for item in batch],
-                    on_stage=[item["stage"] for item in batch])
+                ar_results = [prepared[item["job"]["id"]] for item in batch]
+                try:
+                    nar_results = self.pipeline.generate_nar_batch(ar_results, **batch_args)
+                except MemoryError:
+                    if not self._pause_for_pressure(control, batch):
+                        raise
+                    nar_results = self.pipeline.generate_nar_batch(ar_results, **batch_args)
             except MemoryError:
-                nar_results = None
-                if batch_count > 2:
-                    batch_count, batch = 2, batch[:2]
-                    try:
-                        nar_results = self.pipeline.generate_nar_batch(
-                            [prepared[item["job"]["id"]] for item in batch],
-                            cancelled=[item["cancelled"] for item in batch],
-                            on_stage=[item["stage"] for item in batch])
-                    except MemoryError:
-                        pass
-                if nar_results is None:
-                    for item in batch:
-                        rebuild |= self._render_prepared(
-                            item, prepared[item["job"]["id"]])
-                    index += batch_count
-                    continue
+                for item in batch:
+                    rebuild |= self._render_prepared(
+                        item, prepared[item["job"]["id"]], control)
+                index += batch_count
+                continue
             except Exception as error:
                 for item in batch:
                     rebuild |= self._handle_error(item, error)
@@ -383,21 +568,23 @@ class JobWorker:
                 index += batch_count
                 continue
             for item, nar_result in zip(batch, nar_results):
-                try:
-                    if isinstance(nar_result, Exception):
+                if isinstance(nar_result, Exception):
+                    try:
                         raise nar_result
-                    result = self.pipeline.render_nar(
-                        nar_result, cancelled=item["cancelled"], on_stage=item["stage"])
-                    self._save_result(item, result)
-                except Exception as error:
-                    rebuild |= self._handle_error(item, error)
-                finally:
-                    self._release_context(item)
+                    except Exception as error:
+                        rebuild |= self._handle_error(item, error)
+                    finally:
+                        self._release_context(item)
+                else:
+                    rebuild |= self._render_nar_result(item, nar_result, control)
             index += batch_count
         return rebuild
 
-    def _execute_claimed(self, claimed):
-        contexts = [self._context(job, request) for job, request in claimed]
+    def _execute_parallel_segment(self, contexts):
+        prepared, rebuild = self._prepare_parallel_segment(contexts)
+        return rebuild | self._render_prepared_segment(contexts, prepared)
+
+    def _execute_contexts(self, contexts):
         supports = all(hasattr(self.pipeline, name) for name in (
             "parallel_ar_eligible", "generate_ar", "render_ar"))
         rebuild, index = False, 0
@@ -414,6 +601,10 @@ class JobWorker:
             rebuild |= self._execute_parallel_segment(contexts[index:end])
             index = end
         return rebuild
+
+    def _execute_claimed(self, claimed):
+        contexts = [self._context(job, request) for job, request in claimed]
+        return self._execute_contexts(contexts)
 
 
 class BodyLimit:
