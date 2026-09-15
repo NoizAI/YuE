@@ -167,3 +167,10 @@ Docker Hub 不可达，因此使用服务器已有镜像的固定 SHA256 作为�
 原始数字见 [实测数据](benchmarks/ucloud4-5090.json)。这是两条样本的测量，不是生产流量的 p95 或所有歌曲的保证。
 完整测试记录与可试听音频保存在本次交付目录 `/Users/jishenwei/workFile/2026/0914yue2`。
 常驻优化每首主要减少约 4 秒模型搬运开销，所以短歌曲的相对收益更明显。
+
+## Experimental shared-model batch=2
+
+The opt-in Python pipeline now provides `generate_batch([request_a, request_b])`.
+It batches autoregressive forwards and keeps synthesis/decoding sequential.
+See [batch=2 usage, limits and experiment](batch2.md). The HTTP worker still
+executes one job at a time; this prototype does not alter its queue policy.

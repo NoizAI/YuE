@@ -433,3 +433,8 @@ class YuE2Pipeline:
         Progress(enabled=self.progress).complete(len(audio) / 48000, timing["e2e_seconds"],
                                                 truncated=plan.truncated or semantic.truncated)
         return SongResult(audio, 48000, semantic, latents, config, self.weights, timing, request_id)
+
+    def generate_batch(self, requests, **kwargs):
+        """Experimental batch=2 AR forwards; see yue2.batching for limits."""
+        from .batching import generate_batch
+        return generate_batch(self, requests, **kwargs)
