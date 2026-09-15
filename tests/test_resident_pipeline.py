@@ -52,10 +52,30 @@ def test_decode_cancel_stops_between_tiles():
         assert decode.call_count == 1
 
 
-@pytest.mark.parametrize("options", [{"backend": "vllm"}, {"offload_ar": True}])
-def test_residency_rejects_incompatible_memory_policies(options):
+def test_residency_rejects_ar_offload():
     with pytest.raises(ValueError, match="resident_models requires"):
-        YuE2Pipeline("missing-model", "missing-vae", resident_models=True, **options)
+        YuE2Pipeline("missing-model", "missing-vae", resident_models=True, offload_ar=True)
+
+
+def test_vllm_residency_preloads_acoustic_model_and_vae(monkeypatch):
+    from yue2 import fast, modeling_vae, pipeline
+    subject = object.__new__(YuE2Pipeline)
+    subject.backend, subject.resident_models = "vllm", True
+    subject.device, subject.vae_dir = torch.device("cpu"), "vae"
+    subject._model = subject._vae = None
+    subject._load_model = Mock(return_value=Mock())
+    decoder = Mock()
+    monkeypatch.setattr(fast, "preload_vllm", Mock())
+    monkeypatch.setattr(modeling_vae.YuE2VAE, "from_pretrained", Mock(return_value=decoder))
+    monkeypatch.setattr(pipeline, "synchronize", Mock())
+
+    subject.preload()
+
+    fast.preload_vllm.assert_called_once_with(subject)
+    subject._load_model.assert_called_once_with(for_nar=True)
+    modeling_vae.YuE2VAE.from_pretrained.assert_called_once_with(
+        "vae", decoder_only=True, device="cpu", local_files_only=True)
+    decoder.to.assert_called_once_with(subject.device)
 
 
 def test_stage_callback_failure_stops_before_model_work():

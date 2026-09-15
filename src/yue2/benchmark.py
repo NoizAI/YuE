@@ -14,7 +14,7 @@ import time
 PROFILES = {
     "reference": {"backend": "torch", "resident_models": False, "quantization": "none"},
     "resident": {"backend": "torch", "resident_models": True, "quantization": "none"},
-    "vllm": {"backend": "vllm", "resident_models": False, "quantization": "none"},
+    "vllm": {"backend": "vllm", "resident_models": True, "quantization": "none"},
     "fp8": {"backend": "torch", "resident_models": True, "quantization": "fp8"},
 }
 

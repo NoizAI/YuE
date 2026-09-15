@@ -105,12 +105,18 @@ KV 需求；4 路满 24576 上下文理论上约需 10.5 GiB KV。
 `YUE2_AR_BATCH_WAIT_MS=50` 给同时到达的请求一个很短的合批窗口；低延迟优先时可调低，
 吞吐优先时可在压测后适当调高。
 
-服务启动预加载 vLLM、VAE 和短预热，将初始化移出正式任务。
+服务启动预加载 vLLM、完整 PyTorch MoT、VAE 和短预热，将初始化移出正式任务。
 `YUE2_WARMUP=false` 跳过短预热，但保留 vLLM 引擎预加载。
-vLLM 模式必须保持 `YUE2_RESIDENT_MODELS=false`；完整 PyTorch MoT 模型只在 NAR 阶段使用，
-与常驻 vLLM AR 权重共享同一张卡。`YUE2_VLLM_GPU_MEMORY_UTILIZATION=0.25` 将 vLLM 执行器
-限制在整卡约 25% 的显存目标内，不再固定预分配满上下文 KV。因为 8 GiB 低于 4 路满上下文
-权重加 KV 的理论需求，长请求可能被 vLLM 抢占或重计算；该设置必须以真实并发压测为准。
+32 GB 部署默认保持 `YUE2_RESIDENT_MODELS=true`，避免每首歌在 NAR/VAE 阶段搬运权重。
+NAR 的 acoustic prefix prefill 仍使用 MoT 的 embedding 和 AR 层，因此不能只常驻纯 NAR 子集；
+这会与 vLLM AR 重复保存部分权重，不适合作为较小显存设备的无条件默认。
+`YUE2_VLLM_GPU_MEMORY_UTILIZATION=0.30` 将 vLLM 执行器限制在整卡约 30% 的显存目标内。
+该比例不是整个 vLLM + MoT + VAE 流水线的硬上限；长请求仍可能被抢占或重计算，必须以真实
+并发压测确认总峰值和安全余量。
+
+GPU 5（RTX 5090）实测常驻空闲显存 17.44 GiB，短歌单条 13.58 秒，4 路长歌 84.96 秒；
+四个压力任务全部成功，NVML 峰值 23.83 GiB，容器无重启。0.30 配置提供 4.45 GiB KV cache
+（41,632 tokens），仍不足以保证 4 路请求同时占满 24,576 上下文。
 
 实验选项需要压测、试听后启用：
 

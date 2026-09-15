@@ -38,12 +38,12 @@ class Settings(BaseModel):
     vae_revision: str | None = None
     device: str = "cuda"
     backend: Literal["torch", "torch-eager", "vllm"] = "vllm"
-    resident_models: bool = False
+    resident_models: bool = True
     memory_budget_gib: float = Field(default=30, gt=2, allow_inf_nan=False)
     quantization: Literal["none", "fp8"] = "none"
     ar_concurrency: int = Field(default=4, ge=1, le=16)
     vllm_max_num_seqs: int = Field(default=4, ge=1, le=16)
-    vllm_gpu_memory_utilization: float = Field(default=.25, gt=0, le=.9, allow_inf_nan=False)
+    vllm_gpu_memory_utilization: float = Field(default=.3, gt=0, le=.9, allow_inf_nan=False)
     ar_batch_wait_ms: int = Field(default=50, ge=0, le=1000)
     ode_steps: int = Field(default=32, ge=1, le=64)
     vae_core_frames: int = Field(default=1024, ge=64, le=4096)
@@ -54,8 +54,6 @@ class Settings(BaseModel):
 
     @model_validator(mode="after")
     def compatible_backend(self):
-        if self.backend == "vllm" and self.resident_models:
-            raise ValueError("vLLM requires YUE2_RESIDENT_MODELS=false")
         if self.backend == "vllm" and self.quantization != "none":
             raise ValueError("The current vLLM adapter does not support FP8")
         if self.backend == "vllm" and self.ar_concurrency > self.vllm_max_num_seqs:

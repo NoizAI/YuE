@@ -240,7 +240,7 @@ class _Worker:
         self.reader.start()
         self._send({"model_dir": str(pipe.model_dir), "device": str(pipe.device),
                     "gpu_memory_utilization": getattr(
-                        pipe, "vllm_gpu_memory_utilization", .25),
+                        pipe, "vllm_gpu_memory_utilization", .3),
                     "max_num_seqs": getattr(pipe, "vllm_max_num_seqs", 1)})
         try:
             event = self.ready.get(timeout=1200)

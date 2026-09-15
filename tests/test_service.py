@@ -322,15 +322,13 @@ def test_cancel_racing_success_cannot_publish_result(tmp_path):
 
 def test_environment_settings_validate_and_hide_secret(monkeypatch):
     monkeypatch.setenv("YUE2_API_KEY", KEY)
-    monkeypatch.setenv("YUE2_RESIDENT_MODELS", "false")
+    monkeypatch.delenv("YUE2_RESIDENT_MODELS", raising=False)
     monkeypatch.setenv("YUE2_BACKEND", "vllm")
     settings = Settings.from_env()
-    assert not settings.resident_models and settings.backend == "vllm"
+    assert settings.resident_models and settings.backend == "vllm"
     assert settings.ar_concurrency == settings.vllm_max_num_seqs == 4
-    assert settings.vllm_gpu_memory_utilization == .25
+    assert settings.vllm_gpu_memory_utilization == .3
     assert settings.ar_batch_wait_ms == 50
     assert KEY not in repr(settings)
-    with pytest.raises(ValidationError):
-        Settings(api_key=KEY, backend="vllm", resident_models=True)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)

@@ -133,11 +133,11 @@ class YuE2Pipeline:
                  backend="torch", generation_config=None, verify_hashes=True,
                  vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
                  resident_models=False, vllm_max_num_seqs=4,
-                 vllm_gpu_memory_utilization=.25):
+                 vllm_gpu_memory_utilization=.3):
         if not isinstance(resident_models, bool):
             raise TypeError("resident_models must be True or False")
-        if resident_models and (backend == "vllm" or offload_ar):
-            raise ValueError("resident_models requires a torch backend and offload_ar=False")
+        if resident_models and offload_ar:
+            raise ValueError("resident_models requires offload_ar=False")
         self.resident_models = resident_models
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
@@ -338,6 +338,10 @@ class YuE2Pipeline:
         if self.backend == "vllm":
             from .fast import preload_vllm
             preload_vllm(self)
+            if self.resident_models:
+                # Acoustic synthesis needs the MoT AR path for prefix prefill as
+                # well as its NAR path, so keep the complete PyTorch model.
+                self._load_model(for_nar=True)
         else:
             self._load_model()
         if self._vae is None:
