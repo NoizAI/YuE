@@ -203,3 +203,24 @@ CUDA memory admission. It batches autoregressive forwards and keeps synthesis
 and decoding sequential. See [variable-size batching and sweep](batching.md)
 and the historical [batch=2 experiment](batch2.md). The HTTP worker still
 executes one job at a time; this prototype does not alter its queue policy.
+
+## Two candidates per request
+
+`POST /v1/jobs` accepts `n=2` (default `n=1` retains the original response).
+The pair is admitted atomically, needs two free pending slots, and uses the supplied
+seed and `(seed + 1) % 2**63`. One group ID is returned with two ordered `candidates`.
+The worker generates each candidate independently using the existing concurrent
+inference path; model weights are unchanged.
+
+Poll `GET /v1/jobs/{group_id}` for both candidate snapshots, including their individual
+progress, error and result fields. `result.outputs` lists completed outputs and can
+contain fewer than two entries until both finish. Each candidate has its own job ID
+and audio/score URLs; group IDs do not have an audio file. Group states include
+`partial_failed` when only some candidates succeeded. `truncated` remains distinct
+from complete success. Cancelling a group cancels its unfinished candidates; an
+individual candidate can also be cancelled by ID. Finished results remain available.
+
+The group and children are durable in SQLite, and share one idempotency key at the
+group level. Retrying the same input/key returns the same two candidates; changing
+n or the generation input with that key returns 409. Pair requests use two queue
+slots and compute two outputs; latency is not guaranteed to equal one generation.

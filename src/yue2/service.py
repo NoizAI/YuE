@@ -71,6 +71,7 @@ class Settings(BaseModel):
 
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    n: int = Field(default=1, ge=1, le=2, strict=True)
     style: str = Field(min_length=1, max_length=2000)
     lyrics: str = Field(min_length=1, max_length=16000)
     cot: Literal["full", "melody", "off"] = "full"
@@ -217,9 +218,11 @@ class JobWorker:
     def cancel(self, job_id):
         job = self.store.cancel(job_id)
         with self.lock:
-            cancel_event = self.active.get(job_id)
-            if cancel_event is not None:
-                cancel_event.set()
+            ids = job.get("candidate_ids", [job_id]) if job else [job_id]
+            for child_id in ids:
+                cancel_event = self.active.get(child_id)
+                if cancel_event is not None:
+                    cancel_event.set()
         self.wake.set()
         return job
 
@@ -716,7 +719,7 @@ def create_app(settings=None, pipeline_factory=None):
         if not worker.ready or worker.stop_event.is_set():
             raise HTTPException(503, "Inference worker is not ready", headers={"Retry-After": "5"})
         try:
-            job, created = worker.store.submit(request.model_dump(), settings.max_pending, idempotency_key)
+            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n)
         except QueueFull:
             raise HTTPException(429, "Queue is full", headers={"Retry-After": "5"}) from None
         except IdempotencyConflict:
