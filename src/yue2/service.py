@@ -7,15 +7,18 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import fcntl
 import gc
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import shutil
 import threading
 import time
+import uuid
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -23,7 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .service_store import IdempotencyConflict, JobStore, QueueFull
+from .service_store import IdempotencyConflict, JobStore, QueueFull, TERMINAL
 
 log = logging.getLogger("yue2.service")
 
@@ -52,6 +55,9 @@ class Settings(BaseModel):
     vae_core_frames: int = Field(default=1024, ge=64, le=4096)
     max_pending: int = Field(default=16, ge=1, le=10000)
     task_timeout_seconds: float = Field(default=1200, gt=0, allow_inf_nan=False)
+    artifact_retention_seconds: int = Field(default=86400, ge=60)
+    artifact_max_gib: float = Field(default=5, gt=0, allow_inf_nan=False)
+    artifact_cleanup_interval_seconds: int = Field(default=300, ge=10)
     warmup: bool = True
     local_files_only: bool = False
 
@@ -178,6 +184,7 @@ class JobWorker:
         self.active = {}
         self.ready = False
         self.startup_error = False
+        self.boot_id = uuid.uuid4().hex
         self.pipeline = None
         self.thread = None
         self.lock_file = None
@@ -214,6 +221,71 @@ class JobWorker:
         if self.lock_file is not None:
             self.lock_file.close()
             self.lock_file = None
+
+    @staticmethod
+    def _directory_size(path):
+        total = 0
+        for directory, _, names in os.walk(path, followlinks=False):
+            for name in names:
+                try:
+                    total += (Path(directory) / name).lstat().st_size
+                except FileNotFoundError:
+                    pass
+        return total
+
+    def cleanup_artifacts(self, now=None):
+        """Expire terminal-job files by age and enforce a per-data-directory cap."""
+        now = time.time() if now is None else now
+        artifacts = self.root / "artifacts"
+        if not artifacts.is_dir():
+            return {"removed": 0, "bytes": 0, "remaining_bytes": 0}
+
+        records = self.store.artifact_records()
+        cutoff = now - self.settings.artifact_retention_seconds
+        candidates = []
+        total = 0
+        for path in artifacts.iterdir():
+            if path.is_symlink() or not path.is_dir():
+                continue
+            size = self._directory_size(path)
+            total += size
+            record = records.get(path.name)
+            if record is None:
+                completed_at = path.stat().st_mtime
+                if completed_at < cutoff:
+                    candidates.append((completed_at, path, size))
+                continue
+            if record["status"] not in TERMINAL:
+                continue
+            completed_at = (record["finished_at"] or record["updated_at"]
+                            or record["created_at"] or path.stat().st_mtime)
+            candidates.append((completed_at, path, size))
+
+        selected = {path for completed_at, path, _ in candidates if completed_at < cutoff}
+        remaining = total - sum(size for _, path, size in candidates if path in selected)
+        limit = int(self.settings.artifact_max_gib * 1024 ** 3)
+        for _, path, size in sorted(candidates):
+            if remaining <= limit:
+                break
+            if path not in selected:
+                selected.add(path)
+                remaining -= size
+
+        removed = removed_bytes = 0
+        for _, path, size in sorted(candidates):
+            if path not in selected:
+                continue
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                log.warning("Could not remove expired artifact directory %s", path, exc_info=True)
+                continue
+            removed += 1
+            removed_bytes += size
+        return {"removed": removed, "bytes": removed_bytes,
+                "remaining_bytes": max(0, total - removed_bytes)}
 
     def cancel(self, job_id):
         job = self.store.cancel(job_id)
@@ -684,9 +756,36 @@ def create_app(settings=None, pipeline_factory=None):
     @asynccontextmanager
     async def lifespan(app):
         worker.start()
+        async def publish_load():
+            while True:
+                snapshot = load()
+                path = worker.root / "load.json"
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snapshot))
+                tmp.chmod(0o640)
+                tmp.replace(path)
+                await asyncio.sleep(1)
+        async def maintain_artifacts():
+            while True:
+                try:
+                    result = await asyncio.to_thread(worker.cleanup_artifacts)
+                    if result["removed"]:
+                        log.info("Removed %d expired artifact directories (%.2f GiB)",
+                                 result["removed"], result["bytes"] / 1024 ** 3)
+                except Exception:
+                    log.exception("Artifact cleanup failed")
+                await asyncio.sleep(settings.artifact_cleanup_interval_seconds)
+        publisher = asyncio.create_task(publish_load())
+        janitor = asyncio.create_task(maintain_artifacts())
         try:
             yield
         finally:
+            janitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await janitor
+            publisher.cancel()
+            with suppress(asyncio.CancelledError):
+                await publisher
             await asyncio.to_thread(worker.stop)
 
     app = FastAPI(title="Noiz YuE2", version="0.1.0", lifespan=lifespan)
@@ -710,16 +809,24 @@ def create_app(settings=None, pipeline_factory=None):
 
     @app.get("/health/ready")
     def ready():
-        if not worker.ready:
+        if not worker.ready or (worker.root / "draining").exists():
             return JSONResponse({"status": "failed" if worker.startup_error else "loading"}, status_code=503)
         return {"status": "ready"}
 
+    @app.get("/internal/load", dependencies=[Depends(authorize)])
+    def load():
+        return {**worker.store.load_snapshot(), "schema_version": 1,
+                "boot_id": worker.boot_id,
+                "ready": worker.ready and not (worker.root / "draining").exists(),
+                "capacity": settings.max_pending, "ar_concurrency": settings.ar_concurrency,
+                "nar_batch_size": settings.nar_batch_size}
+
     @app.post("/v1/jobs", status_code=202, dependencies=[Depends(authorize)])
-    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None, min_length=1, max_length=128)):
-        if not worker.ready or worker.stop_event.is_set():
+    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None, min_length=1, max_length=128), x_admission_id: str | None = Header(default=None, max_length=128)):
+        if (worker.root / "draining").exists() or not worker.ready or worker.stop_event.is_set():
             raise HTTPException(503, "Inference worker is not ready", headers={"Retry-After": "5"})
         try:
-            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n)
+            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n, admission_id=x_admission_id)
         except QueueFull:
             raise HTTPException(429, "Queue is full", headers={"Retry-After": "5"}) from None
         except IdempotencyConflict:

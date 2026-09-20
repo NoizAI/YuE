@@ -57,7 +57,7 @@ class JobStore:
                            error={"code": "worker_interrupted", "message": "Worker stopped during generation; submit a new job."})
                 self._write(db, job)
 
-    def submit(self, request, max_pending, idem_key=None, n=1):
+    def submit(self, request, max_pending, idem_key=None, n=1, admission_id=None):
         raw = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
         if type(n) is not int or n not in (1, 2):
             raise ValueError("n must be 1 or 2")
@@ -80,7 +80,7 @@ class JobStore:
                     child_request = {**request, "seed": (request.get("seed", 831001) + index) % (2**63)}
                     child_id = uuid.uuid4().hex
                     child = dict(id=child_id, group_id=group_id, index=index,
-                                 seed=child_request["seed"], status="queued", stage="queued",
+                                 seed=child_request["seed"], admission_id=admission_id, status="queued", stage="queued",
                                  created_at=now, updated_at=now, started_at=None, finished_at=None,
                                  cancel_requested=False, tokens={"abc": 0, "semantic": 0},
                                  result=None, error=None)
@@ -96,7 +96,7 @@ class JobStore:
                            (group_id, "group", now, raw, digest, idem_key, json.dumps(group)))
                 return self._snapshot(db, group), True
             now, job_id = time.time(), uuid.uuid4().hex
-            job = dict(id=job_id, status="queued", stage="queued", created_at=now, updated_at=now,
+            job = dict(id=job_id, admission_id=admission_id, status="queued", stage="queued", created_at=now, updated_at=now,
                        started_at=None, finished_at=None, cancel_requested=False,
                        tokens={"abc": 0, "semantic": 0}, result=None, error=None)
             db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
@@ -156,7 +156,7 @@ class JobStore:
             claimed = []
             for row in rows:
                 job = json.loads(row[0])
-                job.update(status="running", stage="loading", started_at=time.time())
+                job.update(status="running", stage="claimed_waiting", started_at=time.time())
                 self._write(db, job)
                 claimed.append((job, json.loads(row[1])))
             return claimed
@@ -203,3 +203,29 @@ class JobStore:
                 status, result, error = "cancelled", None, None
             job.update(status=status, stage="finished", finished_at=time.time(), result=result, error=error)
             self._write(db, job)
+
+    def load_snapshot(self):
+        """Only candidates count as work; group rows never consume capacity."""
+        sampled_at = time.time()
+        with self.connect() as db:
+            rows = db.execute("SELECT snapshot FROM jobs WHERE status IN ('queued','running')").fetchall()
+        jobs = [json.loads(row[0]) for row in rows]
+        return {"sampled_at": sampled_at, "active_requests": sum(j["status"] == "running" for j in jobs),
+                "queue_depth": sum(j["status"] == "queued" for j in jobs),
+                "items": [{"id": j["id"], "admission_id": j.get("admission_id"),
+                           "stage": j["stage"], "units": 1} for j in jobs]}
+
+    def artifact_records(self):
+        """Return the minimal durable state needed by artifact retention."""
+        with self.connect() as db:
+            rows = db.execute("SELECT id, status, created, snapshot FROM jobs").fetchall()
+        records = {}
+        for row in rows:
+            job = json.loads(row["snapshot"])
+            records[row["id"]] = {
+                "status": row["status"],
+                "finished_at": job.get("finished_at"),
+                "updated_at": job.get("updated_at"),
+                "created_at": job.get("created_at", row["created"]),
+            }
+        return records

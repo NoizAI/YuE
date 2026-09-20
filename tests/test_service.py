@@ -109,6 +109,37 @@ def test_http_success_auth_artifacts_and_reuse(tmp_path):
     assert pipe.closed
 
 
+def test_artifact_cleanup_enforces_cap_and_retention_without_deleting_active(tmp_path):
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False,
+                        artifact_retention_seconds=1000,
+                        artifact_max_gib=20 / 1024 ** 3)
+    worker = JobWorker(settings, lambda _: FakePipeline())
+
+    def create_artifact(seed, *, finish):
+        job, _ = worker.store.submit({**REQUEST, "seed": seed}, 3)
+        claimed, _ = worker.store.claim()
+        assert claimed["id"] == job["id"]
+        path = tmp_path / "artifacts" / job["id"]
+        path.mkdir(parents=True)
+        (path / "audio.flac").write_bytes(b"12345678")
+        if finish:
+            worker.store.finish(job["id"], "succeeded", result={"audio_url": "unused"})
+        return job, path
+
+    old_job, old_path = create_artifact(1, finish=True)
+    _, recent_path = create_artifact(2, finish=True)
+    _, active_path = create_artifact(3, finish=False)
+
+    result = worker.cleanup_artifacts()
+    assert result == {"removed": 1, "bytes": 8, "remaining_bytes": 16}
+    assert not old_path.exists() and recent_path.exists() and active_path.exists()
+    assert worker.store.get(old_job["id"])["status"] == "succeeded"
+
+    result = worker.cleanup_artifacts(now=time.time() + 1001)
+    assert result == {"removed": 1, "bytes": 8, "remaining_bytes": 8}
+    assert not recent_path.exists() and active_path.exists()
+
+
 def test_bounded_admission_idempotency_and_cancellation(tmp_path):
     fake = FakePipeline(blocked=True)
     with service(tmp_path, fake, max_pending=2) as (client, _, app):
@@ -732,6 +763,9 @@ def test_environment_settings_validate_and_hide_secret(monkeypatch):
     assert settings.vllm_max_num_batched_tokens == 8192
     assert settings.nar_batch_size == 2 and settings.ar_nar_overlap
     assert settings.ar_batch_wait_ms == 50
+    assert settings.artifact_retention_seconds == 86400
+    assert settings.artifact_max_gib == 5
+    assert settings.artifact_cleanup_interval_seconds == 300
     assert KEY not in repr(settings)
     with pytest.raises(ValidationError):
         Settings(api_key=KEY, vllm_gpu_memory_utilization=1)

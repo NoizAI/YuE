@@ -89,7 +89,12 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 - 同一数据目录使用进程锁，禁止多 Uvicorn worker。多 GPU 使用不同 CUDA_VISIBLE_DEVICES、端口和数据目录。
 - 推理异常会记录服务端日志并重建模型；HTTP 不暴露原始异常中的内部路径。
 - 数据库与 `YUE2_DATA_DIR/artifacts/<id>/` 中的音频、乐谱、生成记录应一起备份。
-- 当前不自动清理任务或音频，需按业务保留期清理并监控磁盘；未提供多租户隔离、对象存储或分布式队列。
+- 服务每 300 秒自动清理终态任务的本地产物：默认保留 24 小时，并将每个数据目录的
+  `artifacts/` 限制在 5 GiB；流量过高时容量上限优先，最旧产物可能提前过期。
+  `YUE2_ARTIFACT_RETENTION_SECONDS`、`YUE2_ARTIFACT_MAX_GIB` 和
+  `YUE2_ARTIFACT_CLEANUP_INTERVAL_SECONDS` 可调整策略。queued/running 任务不会被清理；
+  SQLite 任务和幂等记录保留，已过期产物的下载接口返回 404。
+- 仍需监控整个磁盘；模型缓存、基准输出等不在服务清理范围内。未提供多租户隔离、对象存储或分布式队列。
 
 ## 加速配置
 
