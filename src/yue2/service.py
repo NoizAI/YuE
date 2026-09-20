@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import fcntl
 import gc
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
 import threading
 import time
+import uuid
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -178,6 +180,7 @@ class JobWorker:
         self.active = {}
         self.ready = False
         self.startup_error = False
+        self.boot_id = uuid.uuid4().hex
         self.pipeline = None
         self.thread = None
         self.lock_file = None
@@ -684,9 +687,22 @@ def create_app(settings=None, pipeline_factory=None):
     @asynccontextmanager
     async def lifespan(app):
         worker.start()
+        async def publish_load():
+            while True:
+                snapshot = load()
+                path = worker.root / "load.json"
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snapshot))
+                tmp.chmod(0o640)
+                tmp.replace(path)
+                await asyncio.sleep(1)
+        publisher = asyncio.create_task(publish_load())
         try:
             yield
         finally:
+            publisher.cancel()
+            with suppress(asyncio.CancelledError):
+                await publisher
             await asyncio.to_thread(worker.stop)
 
     app = FastAPI(title="Noiz YuE2", version="0.1.0", lifespan=lifespan)
@@ -710,16 +726,24 @@ def create_app(settings=None, pipeline_factory=None):
 
     @app.get("/health/ready")
     def ready():
-        if not worker.ready:
+        if not worker.ready or (worker.root / "draining").exists():
             return JSONResponse({"status": "failed" if worker.startup_error else "loading"}, status_code=503)
         return {"status": "ready"}
 
+    @app.get("/internal/load", dependencies=[Depends(authorize)])
+    def load():
+        return {**worker.store.load_snapshot(), "schema_version": 1,
+                "boot_id": worker.boot_id,
+                "ready": worker.ready and not (worker.root / "draining").exists(),
+                "capacity": settings.max_pending, "ar_concurrency": settings.ar_concurrency,
+                "nar_batch_size": settings.nar_batch_size}
+
     @app.post("/v1/jobs", status_code=202, dependencies=[Depends(authorize)])
-    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None, min_length=1, max_length=128)):
-        if not worker.ready or worker.stop_event.is_set():
+    def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None, min_length=1, max_length=128), x_admission_id: str | None = Header(default=None, max_length=128)):
+        if (worker.root / "draining").exists() or not worker.ready or worker.stop_event.is_set():
             raise HTTPException(503, "Inference worker is not ready", headers={"Retry-After": "5"})
         try:
-            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n)
+            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n, admission_id=x_admission_id)
         except QueueFull:
             raise HTTPException(429, "Queue is full", headers={"Retry-After": "5"}) from None
         except IdempotencyConflict:
