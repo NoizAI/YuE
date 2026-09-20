@@ -57,9 +57,11 @@ class JobStore:
                            error={"code": "worker_interrupted", "message": "Worker stopped during generation; submit a new job."})
                 self._write(db, job)
 
-    def submit(self, request, max_pending, idem_key=None):
+    def submit(self, request, max_pending, idem_key=None, n=1):
         raw = json.dumps(request, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        digest = hashlib.sha256(raw.encode()).hexdigest()
+        if type(n) is not int or n not in (1, 2):
+            raise ValueError("n must be 1 or 2")
+        digest = hashlib.sha256((raw if n == 1 else "pair:" + raw).encode()).hexdigest()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if idem_key is not None:
@@ -67,10 +69,32 @@ class JobStore:
                 if existing:
                     if existing[0] != digest:
                         raise IdempotencyConflict()
-                    return json.loads(existing[1]), False
+                    return self._snapshot(db, json.loads(existing[1])), False
             pending = db.execute("SELECT count(*) FROM jobs WHERE status IN ('queued','running')").fetchone()[0]
-            if pending >= max_pending:
+            if pending + n > max_pending:
                 raise QueueFull()
+            if n == 2:
+                now, group_id = time.time(), uuid.uuid4().hex
+                children = []
+                for index in range(2):
+                    child_request = {**request, "seed": (request.get("seed", 831001) + index) % (2**63)}
+                    child_id = uuid.uuid4().hex
+                    child = dict(id=child_id, group_id=group_id, index=index,
+                                 seed=child_request["seed"], status="queued", stage="queued",
+                                 created_at=now, updated_at=now, started_at=None, finished_at=None,
+                                 cancel_requested=False, tokens={"abc": 0, "semantic": 0},
+                                 result=None, error=None)
+                    child_raw = json.dumps(child_request, sort_keys=True, separators=(",", ":"), allow_nan=False)
+                    db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
+                               (child_id, "queued", now, child_raw,
+                                hashlib.sha256(child_raw.encode()).hexdigest(), None, json.dumps(child)))
+                    children.append(child_id)
+                group = dict(id=group_id, kind="group", n=2, candidate_ids=children,
+                             created_at=now, updated_at=now)
+                # Group rows are metadata only: workers claim the two children.
+                db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,?)",
+                           (group_id, "group", now, raw, digest, idem_key, json.dumps(group)))
+                return self._snapshot(db, group), True
             now, job_id = time.time(), uuid.uuid4().hex
             job = dict(id=job_id, status="queued", stage="queued", created_at=now, updated_at=now,
                        started_at=None, finished_at=None, cancel_requested=False,
@@ -81,8 +105,41 @@ class JobStore:
 
     def get(self, job_id):
         with self.connect() as db:
+            db.execute("BEGIN")
             row = db.execute("SELECT snapshot FROM jobs WHERE id=?", (job_id,)).fetchone()
-            return json.loads(row[0]) if row else None
+            return self._snapshot(db, json.loads(row[0])) if row else None
+
+    @staticmethod
+    def _snapshot(db, job):
+        if job.get("kind") != "group":
+            return job
+        children = [json.loads(db.execute("SELECT snapshot FROM jobs WHERE id=?", (child_id,)).fetchone()[0])
+                    for child_id in job["candidate_ids"]]
+        states = [child["status"] for child in children]
+        complete = all(state in TERMINAL for state in states)
+        if not complete:
+            status = "queued" if all(state == "queued" for state in states) else "running"
+        elif all(state == "succeeded" for state in states):
+            status = "succeeded"
+        elif all(state in {"succeeded", "truncated"} for state in states):
+            status = "truncated"
+        elif all(state == "cancelled" for state in states):
+            status = "cancelled"
+        elif any(state in {"succeeded", "truncated"} for state in states):
+            status = "partial_failed"
+        else:
+            status = "failed"
+        starts = [c["started_at"] for c in children if c["started_at"] is not None]
+        outputs = [{"id": c["id"], "index": c["index"], "seed": c["seed"], **c["result"]}
+                   for c in children if c.get("result")]
+        return {**job, "status": status, "stage": "finished" if complete else status,
+                "candidates": children, "completed_count": sum(state in TERMINAL for state in states),
+                "updated_at": max(c["updated_at"] for c in children),
+                "started_at": min(starts) if starts else None,
+                "finished_at": max(c["finished_at"] for c in children) if complete else None,
+                "cancel_requested": any(c["cancel_requested"] for c in children),
+                "tokens": {key: sum(c["tokens"].get(key, 0) for c in children) for key in ("abc", "semantic")},
+                "result": {"outputs": outputs} if outputs else None, "error": None}
 
     def claim(self):
         claimed = self.claim_many(1)
@@ -120,6 +177,15 @@ class JobStore:
             if row is None:
                 return None
             job = json.loads(row[0])
+            if job.get("kind") == "group":
+                for child_id in job["candidate_ids"]:
+                    child = json.loads(db.execute("SELECT snapshot FROM jobs WHERE id=?", (child_id,)).fetchone()[0])
+                    if child["status"] not in TERMINAL:
+                        child["cancel_requested"] = True
+                        if child["status"] == "queued":
+                            child.update(status="cancelled", stage="finished", finished_at=time.time())
+                        self._write(db, child)
+                return self._snapshot(db, job)
             if job["status"] not in TERMINAL:
                 job["cancel_requested"] = True
                 if job["status"] == "queued":
