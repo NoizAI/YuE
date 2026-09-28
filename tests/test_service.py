@@ -6,6 +6,7 @@ import threading
 import time
 import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -107,6 +108,41 @@ def test_http_success_auth_artifacts_and_reuse(tmp_path):
         assert client.post("/v1/jobs/unknown/cancel").status_code == 404
         assert client.get("/openapi.json").status_code == 200
     assert pipe.closed
+
+
+def test_mp3_artifact_is_encoded_once_and_flac_remains_available(tmp_path):
+    with service(tmp_path) as (client, _, _):
+        job = terminal(client, submit(client))
+        mp3_url = job["result"]["audio_mp3_url"]
+        assert mp3_url == f"/v1/jobs/{job['id']}/audio?format=mp3"
+
+        def encode(command, **kwargs):
+            assert command[command.index("-b:a") + 1] == "192k"
+            assert command[command.index("-i") + 1].endswith("audio.flac")
+            Path(command[-1]).write_bytes(b"encoded-mp3")
+
+        with patch("yue2.service.subprocess.run", side_effect=encode) as run:
+            first = client.get(mp3_url)
+            second = client.get(mp3_url)
+        assert first.status_code == second.status_code == 200
+        assert first.headers["content-type"] == "audio/mpeg"
+        assert first.content == second.content == b"encoded-mp3"
+        assert run.call_count == 1
+        assert client.get(job["result"]["audio_url"]).content == b"fake-audio-for-transport-test"
+
+
+def test_mp3_encoding_failure_keeps_flac_and_allows_retry(tmp_path):
+    with service(tmp_path) as (client, _, _):
+        job = terminal(client, submit(client))
+        mp3_url = job["result"]["audio_mp3_url"]
+        with patch("yue2.service.subprocess.run", side_effect=RuntimeError("encode failed")):
+            response = client.get(mp3_url)
+        assert response.status_code == 503
+        assert client.get(job["result"]["audio_url"]).status_code == 200
+        assert not (tmp_path / "artifacts" / job["id"] / "audio.mp3.tmp").exists()
+        with patch("yue2.service.subprocess.run",
+                   side_effect=lambda command, **kwargs: Path(command[-1]).write_bytes(b"mp3")):
+            assert client.get(mp3_url).content == b"mp3"
 
 
 def test_artifact_cleanup_enforces_cap_and_retention_without_deleting_active(tmp_path):

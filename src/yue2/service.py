@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -801,7 +802,20 @@ def create_app(settings=None, pipeline_factory=None):
         job = worker.store.get(job_id)
         if job is None:
             raise HTTPException(404, "Job not found")
-        return job
+
+        def add_mp3_url(item):
+            item = dict(item)
+            result = item.get("result")
+            if (item.get("status") in {"succeeded", "truncated"}
+                    and isinstance(result, dict) and result.get("audio_url")):
+                item["result"] = {**result,
+                                  "audio_mp3_url": f"/v1/jobs/{item['id']}/audio?format=mp3"}
+            if isinstance(item.get("candidates"), list):
+                item["candidates"] = [add_mp3_url(candidate)
+                                      for candidate in item["candidates"]]
+            return item
+
+        return add_mp3_url(job)
 
     @app.get("/health/live")
     def live():
@@ -855,8 +869,40 @@ def create_app(settings=None, pipeline_factory=None):
         return FileResponse(path, media_type=media, filename=f"{job['id']}-{name}")
 
     @app.get("/v1/jobs/{job_id}/audio", dependencies=[Depends(authorize)])
-    def audio(job_id: str):
-        return artifact(job_id, "audio.flac", "audio/flac")
+    def audio(job_id: str, format: Literal["flac", "mp3"] = "flac"):
+        if format == "flac":
+            return artifact(job_id, "audio.flac", "audio/flac")
+        job = get_job(job_id)
+        if job["status"] not in {"succeeded", "truncated"}:
+            raise HTTPException(409, "Artifact is not available for this job state")
+        directory = worker.root / "artifacts" / job["id"]
+        source = directory / "audio.flac"
+        if not source.is_file():
+            raise HTTPException(404, "Artifact not found")
+        target = directory / "audio.mp3"
+        if not target.is_file() or target.stat().st_size == 0:
+            with (directory / "audio.mp3.lock").open("w") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                if not target.is_file() or target.stat().st_size == 0:
+                    temporary = directory / "audio.mp3.tmp"
+                    try:
+                        subprocess.run(
+                            ["ffmpeg", "-nostdin", "-y", "-loglevel", "error",
+                             "-i", str(source), "-vn", "-c:a", "libmp3lame",
+                             "-b:a", "192k", "-threads", "1", "-f", "mp3",
+                             str(temporary)],
+                            check=True, capture_output=True, timeout=300,
+                        )
+                        if not temporary.is_file() or temporary.stat().st_size == 0:
+                            raise RuntimeError("MP3 encoder returned an empty file")
+                        os.replace(temporary, target)
+                    except (OSError, RuntimeError, subprocess.CalledProcessError,
+                            subprocess.TimeoutExpired):
+                        temporary.unlink(missing_ok=True)
+                        log.exception("MP3 encoding failed: job=%s", job_id)
+                        raise HTTPException(503, "MP3 artifact is temporarily unavailable") from None
+        return FileResponse(target, media_type="audio/mpeg",
+                            filename=f"{job['id']}-audio.mp3")
 
     @app.get("/v1/jobs/{job_id}/score", dependencies=[Depends(authorize)])
     def score(job_id: str):
