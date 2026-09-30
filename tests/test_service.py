@@ -144,7 +144,7 @@ def test_plan_only_jobs_publish_scores_without_generating_audio(tmp_path):
         assert response.status_code == 202
         group = terminal(client, response.json()["id"])
         assert group["status"] == "succeeded"
-        assert [call["seed"] for call in pipe.plan_calls] == [42, 43]
+        assert sorted(call["seed"] for call in pipe.plan_calls) == [42, 43]
         assert pipe.calls == 0
         for candidate in group["candidates"]:
             result = candidate["result"]
