@@ -58,7 +58,20 @@ curl -X POST http://127.0.0.1:8000/v1/jobs \
 
 返回 202，含 `id`、`status=queued`；Location 指向状态接口。
 相同幂等键和相同输入重试返回原任务（200），不同输入返回 409；幂等键不自动过期。
-再次生成需用新键，接口每次只生成一个候选。
+再次生成需用新键；默认生成一个候选，`n=2` 时生成两个候选。
+
+只需要 YuE2 规划的 ABC 时，在相同接口提交 `"stage":"plan"`，并使用
+`cot=full` 或 `cot=melody`。此模式不接受外部 `abc`，也不执行语义 token、NAR 或 VAE
+音频生成；不传 `stage` 时仍按原来的完整音频流程执行。
+
+```json
+{"stage":"plan","style":"Instrumental, warm piano, no vocals","lyrics":"[Intro]\n\n[Verse]\n\n[Outro]","cot":"full","seed":42}
+```
+
+轮询到 `succeeded` 后，从 `result.score_url` 下载 ABC。结果包含
+`output_type="score"`、`truncated.abc` 和规划耗时，但没有 `audio_url`、采样率或
+音频时长；请求该任务的 `/audio` 返回 404。`truncated` 表示乐谱不完整，不应继续用于
+正式生成。`n=2` 时两个候选分别规划乐谱并返回各自的 `score_url`。
 
 ```bash
 JOB_ID=替换为返回的id

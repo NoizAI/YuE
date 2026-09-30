@@ -110,6 +110,55 @@ def test_http_success_auth_artifacts_and_reuse(tmp_path):
     assert pipe.closed
 
 
+def test_plan_only_jobs_publish_scores_without_generating_audio(tmp_path):
+    class PlanningPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.plan_calls = []
+
+        def plan(self, *, cancelled, on_token, **kwargs):
+            self.plan_calls.append(kwargs)
+            on_token("abc", 1)
+            if cancelled():
+                raise InterruptedError()
+
+            def save(output):
+                Path(output, "score.abc").write_text("X:1\nK:C\nCDEF|")
+
+            return SimpleNamespace(abc="X:1\nK:C\nCDEF|", truncated=False,
+                                   timing={"seconds": .01}, save=save)
+
+        def parallel_ar_eligible(self, request):
+            assert "stage" not in request
+            return False
+
+        def generate_ar(self, **kwargs):
+            raise AssertionError("Plan-only jobs must skip semantic generation")
+
+        def render_ar(self, **kwargs):
+            raise AssertionError("Plan-only jobs must skip audio rendering")
+
+    pipe = PlanningPipeline()
+    with service(tmp_path, pipe) as (client, _, _):
+        response = client.post("/v1/jobs", json={**REQUEST, "cot": "full", "stage": "plan", "n": 2})
+        assert response.status_code == 202
+        group = terminal(client, response.json()["id"])
+        assert group["status"] == "succeeded"
+        assert [call["seed"] for call in pipe.plan_calls] == [42, 43]
+        assert pipe.calls == 0
+        for candidate in group["candidates"]:
+            result = candidate["result"]
+            assert result["output_type"] == "score"
+            assert result["truncated"] == {"abc": False}
+            assert result["timing"]["abc"] == {"seconds": .01}
+            assert "audio_url" not in result
+            assert candidate["tokens"] == {"abc": 1, "semantic": 0}
+            assert client.get(result["score_url"]).text == "X:1\nK:C\nCDEF|"
+            assert client.get(f"/v1/jobs/{candidate['id']}/audio").status_code == 404
+        assert terminal(client, submit(client, seed=44))["status"] == "succeeded"
+        assert pipe.calls == 1
+
+
 def test_mp3_artifact_is_encoded_once_and_flac_remains_available(tmp_path):
     with service(tmp_path) as (client, _, _):
         job = terminal(client, submit(client))
@@ -298,6 +347,9 @@ def test_shutdown_cancels_active_and_leaves_queue_for_restart(tmp_path):
 
 @pytest.mark.parametrize("change", [{"seed": True}, {"seed": 2**63}, {"lyrics": " "},
                                     {"style": "a" * 2001}, {"cot": "off", "abc": "X:1"},
+                                    {"stage": "plan", "cot": "off"},
+                                    {"stage": "plan", "abc": "X:1"},
+                                    {"stage": "unknown"},
                                     {"unknown": 1}, {"cfg_scale": float("nan")}])
 def test_request_validation(change):
     with pytest.raises(ValidationError):

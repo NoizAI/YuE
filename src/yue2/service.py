@@ -79,6 +79,7 @@ class Settings(BaseModel):
 class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     n: int = Field(default=1, ge=1, le=2, strict=True)
+    stage: Literal["audio", "plan"] = "audio"
     style: str = Field(min_length=1, max_length=2000)
     lyrics: str = Field(min_length=1, max_length=16000)
     cot: Literal["full", "melody", "off"] = "full"
@@ -95,6 +96,8 @@ class GenerateRequest(BaseModel):
 
     @model_validator(mode="after")
     def score_mode(self):
+        if self.stage == "plan" and (self.cot == "off" or self.abc is not None):
+            raise ValueError("Plan-only jobs require cot=full or melody and no supplied ABC")
         if self.abc is not None and self.cot == "off":
             raise ValueError("ABC requires cot=full or melody")
         return self
@@ -341,7 +344,9 @@ class JobWorker:
         supports = all(hasattr(self.pipeline, name) for name in (
             "parallel_ar_eligible", "generate_ar", "render_ar"))
         if not supports or not all(
-                self.pipeline.parallel_ar_eligible(context["request"]) for context in contexts):
+                context["request"].get("stage") != "plan"
+                and self.pipeline.parallel_ar_eligible(context["request"])
+                for context in contexts):
             return {"kind": "exclusive", "contexts": contexts}
         if not control.begin_ar(self.stop_event):
             return {"kind": "exclusive", "contexts": contexts}
@@ -502,6 +507,23 @@ class JobWorker:
             "configuration": result.config,
         })
 
+    def _save_plan(self, context, plan, started):
+        job_id = context["job"]["id"]
+        context["stage"]("saving")
+        if not plan.abc or not plan.abc.strip():
+            raise ValueError("Planner returned an empty ABC score")
+        output = self.root / "artifacts" / job_id
+        output.mkdir(parents=True, exist_ok=False)
+        plan.save(output)
+        if context["cancelled"]():
+            raise InterruptedError("Cancelled after saving")
+        self.store.finish(job_id, "truncated" if plan.truncated else "succeeded", result={
+            "output_type": "score",
+            "score_url": f"/v1/jobs/{job_id}/score",
+            "truncated": {"abc": plan.truncated},
+            "timing": {"abc": plan.timing, "e2e_seconds": time.monotonic() - started},
+        })
+
     def _handle_error(self, context, error):
         job_id = context["job"]["id"]
         if isinstance(error, InterruptedError):
@@ -531,9 +553,18 @@ class JobWorker:
         try:
             if context["cancelled"]():
                 raise InterruptedError("Cancelled before generation")
-            result = self.pipeline(**context["request"], cancelled=context["cancelled"],
-                                   on_token=context["token"], on_stage=context["stage"])
-            self._save_result(context, result)
+            request = context["request"]
+            if request.get("stage") == "plan":
+                context["stage"]("planning")
+                started = time.monotonic()
+                plan = self.pipeline.plan(
+                    **{key: value for key, value in request.items() if key != "stage"},
+                    cancelled=context["cancelled"], on_token=context["token"])
+                self._save_plan(context, plan, started)
+            else:
+                result = self.pipeline(**request, cancelled=context["cancelled"],
+                                       on_token=context["token"], on_stage=context["stage"])
+                self._save_result(context, result)
             return False
         except Exception as error:
             return self._handle_error(context, error)
@@ -704,12 +735,14 @@ class JobWorker:
         rebuild, index = False, 0
         while index < len(contexts):
             context = contexts[index]
-            if not supports or not self.pipeline.parallel_ar_eligible(context["request"]):
+            if (not supports or context["request"].get("stage") == "plan"
+                    or not self.pipeline.parallel_ar_eligible(context["request"])):
                 rebuild |= self._execute_serial(context)
                 index += 1
                 continue
             end = index + 1
             while (end < len(contexts)
+                   and contexts[end]["request"].get("stage") != "plan"
                    and self.pipeline.parallel_ar_eligible(contexts[end]["request"])):
                 end += 1
             rebuild |= self._execute_parallel_segment(contexts[index:end])
@@ -840,7 +873,10 @@ def create_app(settings=None, pipeline_factory=None):
         if (worker.root / "draining").exists() or not worker.ready or worker.stop_event.is_set():
             raise HTTPException(503, "Inference worker is not ready", headers={"Retry-After": "5"})
         try:
-            job, created = worker.store.submit(request.model_dump(exclude={"n"}), settings.max_pending, idempotency_key, n=request.n, admission_id=x_admission_id)
+            body = request.model_dump(exclude={"n", "stage"})
+            if request.stage == "plan":
+                body["stage"] = "plan"
+            job, created = worker.store.submit(body, settings.max_pending, idempotency_key, n=request.n, admission_id=x_admission_id)
         except QueueFull:
             raise HTTPException(429, "Queue is full", headers={"Retry-After": "5"}) from None
         except IdempotencyConflict:
