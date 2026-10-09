@@ -245,6 +245,34 @@ def test_lyric_timestamps_are_aligned_inline_for_each_candidate(tmp_path):
     assert aligner.closed
 
 
+@pytest.mark.parametrize("cot", ["melody", "full"])
+def test_lyric_timestamps_align_cover_jobs_with_supplied_score(tmp_path, cot):
+    class RecordingPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def __call__(self, **kwargs):
+            self.requests.append({key: value for key, value in kwargs.items()
+                                  if key not in {"cancelled", "on_stage", "on_token"}})
+            return super().__call__(**kwargs)
+
+    aligner, pipe = FakeAligner(), RecordingPipeline()
+    cover = {**REQUEST, "n": 2, "cot": cot, "abc": "X:1\nK:C\nCDEF|", "lyric_timestamps": True}
+    with service(tmp_path, pipe, lambda settings: aligner, lyric_align=True) as (client, _, _):
+        response = client.post("/v1/jobs", json=cover)
+        assert response.status_code == 202
+        group = terminal(client, response.json()["id"])
+        assert group["status"] == "succeeded"
+        for candidate in group["candidates"]:
+            assert candidate["result"]["lyric_timings"][0]["text"] == "An original song"
+            assert candidate["result"]["lyric_timings_engine"] == "mms"
+        assert aligner.calls == [(b"fake-audio-for-transport-test", REQUEST["lyrics"])] * 2
+        assert [request["abc"] for request in pipe.requests] == [cover["abc"]] * 2
+        assert all(request["cot"] == cot and "lyric_timestamps" not in request
+                   for request in pipe.requests)
+
+
 def test_lyric_timestamps_keep_idempotency_of_requests_without_the_flag(tmp_path):
     with service(tmp_path, lyric_align=True, aligner_factory=lambda settings: FakeAligner()) as (client, _, _):
         headers = {"Idempotency-Key": "same-order"}

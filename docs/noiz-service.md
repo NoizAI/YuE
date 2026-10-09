@@ -74,7 +74,7 @@ curl -X POST http://127.0.0.1:8000/v1/jobs \
 正式生成。`n=2` 时两个候选分别规划乐谱并返回各自的 `score_url`。
 
 需要歌词时间戳时，在完整音频任务里加 `"lyric_timestamps": true`（默认 `false`，`stage=plan`
-不支持）。音频保存后，worker 把提交的歌词强制对齐到生成的混音上，再标记任务完成，
+不支持）；带 `abc` 的 cover 任务同样适用。音频保存后，worker 把提交的歌词强制对齐到生成的混音上，再标记任务完成，
 所以轮询到 `succeeded` / `truncated` 时结果里已带时间戳；`n=2` 时每个候选各自对齐。
 切行规则与 MV 的 `lyricLines()` 一致：丢掉空行和 `[Verse]` 这类段落标签；整段没有换行时，
 再按句末标点和中日韩词拆分。语言按歌词文字自动判断 zh/ja/ko/en。
