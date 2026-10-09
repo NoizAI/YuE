@@ -61,6 +61,9 @@ class Settings(BaseModel):
     artifact_cleanup_interval_seconds: int = Field(default=300, ge=10)
     warmup: bool = True
     local_files_only: bool = False
+    lyric_align: bool = False
+    lyric_align_model: str = "MahmoudAshraf/mms-300m-1130-forced-aligner"
+    lyric_align_whisper_model: str = "base"
 
     @model_validator(mode="after")
     def compatible_backend(self):
@@ -86,6 +89,7 @@ class GenerateRequest(BaseModel):
     seed: int = Field(default=831001, ge=0, lt=2**63, strict=True)
     abc: str | None = Field(default=None, min_length=1, max_length=64000)
     cfg_scale: float | None = Field(default=None, ge=0, le=20)
+    lyric_timestamps: bool = Field(default=False, strict=True)
 
     @field_validator("style", "lyrics", "abc")
     @classmethod
@@ -100,6 +104,8 @@ class GenerateRequest(BaseModel):
             raise ValueError("Plan-only jobs require cot=full or melody and no supplied ABC")
         if self.abc is not None and self.cot == "off":
             raise ValueError("ABC requires cot=full or melody")
+        if self.stage == "plan" and self.lyric_timestamps:
+            raise ValueError("Lyric timestamps require stage=audio")
         return self
 
 
@@ -115,6 +121,15 @@ def build_pipeline(settings):
         vllm_gpu_memory_utilization=settings.vllm_gpu_memory_utilization,
         vae_core_frames=settings.vae_core_frames, local_files_only=settings.local_files_only,
         generation_config=GenerationConfig(ode_steps=settings.ode_steps), progress=False)
+
+
+def build_lyric_aligner(settings):
+    from .lyric_align import LyricAligner
+    aligner = LyricAligner(mms_model=settings.lyric_align_model,
+                           whisper_model=settings.lyric_align_whisper_model,
+                           device=settings.device, local_files_only=settings.local_files_only)
+    aligner.load()
+    return aligner
 
 
 class _AROverlapControl:
@@ -178,8 +193,9 @@ class _AROverlapControl:
 
 
 class JobWorker:
-    def __init__(self, settings, factory):
+    def __init__(self, settings, factory, aligner_factory=build_lyric_aligner):
         self.settings, self.factory = settings, factory
+        self.aligner_factory, self.aligner = aligner_factory, None
         self.root = settings.data_dir.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.store = JobStore(self.root / "jobs.sqlite3")
@@ -306,6 +322,11 @@ class JobWorker:
         self.ready = False
         self.pipeline = self.factory(self.settings)
         self.pipeline.preload()
+        if self.settings.lyric_align and self.aligner is None:
+            try:
+                self.aligner = self.aligner_factory(self.settings)
+            except Exception:
+                log.exception("Lyric aligner unavailable; lyric timestamps will be skipped")
         if self.settings.warmup and not self.stop_event.is_set():
             # Short disposable generation warms libraries, not a cached production song.
             self.pipeline(style="English piano pop", lyrics="[Verse]\nA new day begins",
@@ -453,15 +474,20 @@ class JobWorker:
             self.ready = False
             if self.pipeline is not None:
                 self.pipeline.close()
+            if self.aligner is not None:
+                self.aligner.close()
 
     def _context(self, job, request):
+        request = dict(request)
+        lyric_timestamps = bool(request.pop("lyric_timestamps", False))
         job_id, cancel_event = job["id"], threading.Event()
         with self.lock:
             self.active[job_id] = cancel_event
         if self.store.get(job_id)["cancel_requested"]:
             cancel_event.set()
         context = {
-            "job": job, "request": request, "cancel_event": cancel_event,
+            "job": job, "request": request, "lyric_timestamps": lyric_timestamps,
+            "cancel_event": cancel_event,
             "deadline": time.monotonic() + self.settings.task_timeout_seconds,
             "counts": {"abc": 0, "semantic": 0}, "last_report": 0.0,
             "pipeline": {"ar_nar_overlap": bool(self.settings.ar_nar_overlap),
@@ -496,16 +522,38 @@ class JobWorker:
         if isinstance(getattr(result, "config", None), dict):
             result.config["service_pipeline"] = dict(context["pipeline"])
         saved = result.save_artifacts(output)
+        lyrics = self._align_lyrics(context, output / "audio.flac") if context["lyric_timestamps"] else {}
         if context["cancelled"]():
             raise InterruptedError("Cancelled after saving")
         truncated = any(saved["truncated"].values())
+        timing = saved["timing"]
+        if "seconds" in lyrics:
+            timing = {**timing, "lyric_alignment_seconds": lyrics.pop("seconds")}
         self.store.finish(job_id, "truncated" if truncated else "succeeded", result={
             "audio_url": f"/v1/jobs/{job_id}/audio",
             "score_url": f"/v1/jobs/{job_id}/score" if result.abc else None,
             "audio_seconds": saved["audio_seconds"], "sample_rate": saved["sample_rate"],
-            "truncated": saved["truncated"], "timing": saved["timing"],
-            "configuration": result.config,
+            "truncated": saved["truncated"], "timing": timing,
+            "configuration": result.config, **lyrics,
         })
+
+    def _align_lyrics(self, context, audio_path):
+        """Alignment failures never fail the job; the audio is still delivered."""
+        if self.aligner is None:
+            return {"lyric_timings": None, "lyric_timings_error": {
+                "code": "aligner_unavailable", "message": "Lyric aligner is not loaded on this worker."}}
+        context["stage"]("aligning")
+        started = time.monotonic()
+        try:
+            timings, engine = self.aligner.align(audio_path, context["request"]["lyrics"])
+        except Exception as error:
+            log.warning("Lyric alignment failed: job=%s error=%s", context["job"]["id"], error)
+            return {"lyric_timings": None, "seconds": time.monotonic() - started,
+                    "lyric_timings_error": {
+                        "code": "alignment_failed",
+                        "message": "Lyrics could not be aligned to the generated audio."}}
+        return {"lyric_timings": timings, "lyric_timings_engine": engine,
+                "seconds": time.monotonic() - started}
 
     def _save_plan(self, context, plan, started):
         job_id = context["job"]["id"]
@@ -783,9 +831,10 @@ class BodyLimit:
         await self.app(scope, replay, send)
 
 
-def create_app(settings=None, pipeline_factory=None):
+def create_app(settings=None, pipeline_factory=None, aligner_factory=None):
     settings = settings or Settings.from_env()
-    worker = JobWorker(settings, pipeline_factory or build_pipeline)
+    worker = JobWorker(settings, pipeline_factory or build_pipeline,
+                       aligner_factory or build_lyric_aligner)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -872,10 +921,14 @@ def create_app(settings=None, pipeline_factory=None):
     def submit(request: GenerateRequest, idempotency_key: str | None = Header(default=None, min_length=1, max_length=128), x_admission_id: str | None = Header(default=None, max_length=128)):
         if (worker.root / "draining").exists() or not worker.ready or worker.stop_event.is_set():
             raise HTTPException(503, "Inference worker is not ready", headers={"Retry-After": "5"})
+        if request.lyric_timestamps and not settings.lyric_align:
+            raise HTTPException(400, "Lyric timestamps are not enabled on this worker")
         try:
-            body = request.model_dump(exclude={"n", "stage"})
+            body = request.model_dump(exclude={"n", "stage", "lyric_timestamps"})
             if request.stage == "plan":
                 body["stage"] = "plan"
+            if request.lyric_timestamps:
+                body["lyric_timestamps"] = True
             job, created = worker.store.submit(body, settings.max_pending, idempotency_key, n=request.n, admission_id=x_admission_id)
         except QueueFull:
             raise HTTPException(429, "Queue is full", headers={"Retry-After": "5"}) from None

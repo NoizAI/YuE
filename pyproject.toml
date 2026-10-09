@@ -25,6 +25,7 @@ dependencies = [
 fast = ["vllm==0.19.0", "triton==3.6.0"]
 server = ["fastapi>=0.115,<1", "pydantic>=2.10,<3", "uvicorn>=0.34,<1",
           "httpx>=0.28,<1", "vllm==0.19.0", "triton==3.6.0"]
+align = ["torchaudio==2.10.0", "uroman==1.3.1.1", "stable-ts==2.19.1"]
 test = ["pytest==9.0.3", "fastapi>=0.115,<1", "pydantic>=2.10,<3", "httpx>=0.28,<1"]
 
 [project.urls]

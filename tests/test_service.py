@@ -67,10 +67,25 @@ def wait_for(check, timeout=5):
     pytest.fail("Timed out waiting for worker state")
 
 
+class FakeAligner:
+    def __init__(self, *, failure=None):
+        self.calls, self.failure, self.closed = [], failure, False
+
+    def align(self, audio_path, lyrics):
+        self.calls.append((Path(audio_path).read_bytes(), lyrics))
+        if self.failure:
+            raise self.failure
+        return [{"text": "An original song", "start": 1.5, "end": 3.25}], "mms"
+
+    def close(self):
+        self.closed = True
+
+
 @contextmanager
-def service(tmp_path, fake=None, **options):
+def service(tmp_path, fake=None, aligner_factory=None, **options):
     fake = fake or FakePipeline()
-    app = create_app(Settings(api_key=KEY, data_dir=tmp_path, warmup=False, **options), lambda settings: fake)
+    app = create_app(Settings(api_key=KEY, data_dir=tmp_path, warmup=False, **options),
+                     lambda settings: fake, aligner_factory)
     with TestClient(app, headers=HEADERS) as client:
         wait_for(lambda: client.get("/health/ready").status_code == 200)
         yield client, fake, app
@@ -192,6 +207,88 @@ def test_mp3_encoding_failure_keeps_flac_and_allows_retry(tmp_path):
         with patch("yue2.service.subprocess.run",
                    side_effect=lambda command, **kwargs: Path(command[-1]).write_bytes(b"mp3")):
             assert client.get(mp3_url).content == b"mp3"
+
+
+def test_lyric_timestamps_are_aligned_inline_for_each_candidate(tmp_path):
+    class RecordingPipeline(FakePipeline):
+        def __init__(self):
+            super().__init__()
+            self.requests = []
+
+        def __call__(self, **kwargs):
+            self.requests.append({key: value for key, value in kwargs.items()
+                                  if key not in {"cancelled", "on_stage", "on_token"}})
+            return super().__call__(**kwargs)
+
+    aligner = FakeAligner()
+    pipe = RecordingPipeline()
+    with service(tmp_path, pipe, lambda settings: aligner, lyric_align=True) as (client, _, app):
+        response = client.post("/v1/jobs", json={**REQUEST, "n": 2, "lyric_timestamps": True})
+        assert response.status_code == 202
+        group = terminal(client, response.json()["id"])
+        assert group["status"] == "succeeded"
+        for candidate in group["candidates"]:
+            result = candidate["result"]
+            assert result["lyric_timings"] == [{"text": "An original song", "start": 1.5, "end": 3.25}]
+            assert result["lyric_timings_engine"] == "mms"
+            assert result["timing"]["lyric_alignment_seconds"] >= 0
+            assert result["timing"]["e2e_seconds"] == .01
+            assert "lyric_timings_error" not in result
+        assert group["result"]["outputs"][0]["lyric_timings"][0]["start"] == 1.5
+        assert aligner.calls == [(b"fake-audio-for-transport-test", REQUEST["lyrics"])] * 2
+        assert all("lyric_timestamps" not in request for request in pipe.requests)
+
+        plain = terminal(client, submit(client, seed=50))["result"]
+        assert not any(key.startswith("lyric_timings") for key in plain)
+        assert "lyric_alignment_seconds" not in plain["timing"]
+        assert len(aligner.calls) == 2
+    assert aligner.closed
+
+
+def test_lyric_timestamps_keep_idempotency_of_requests_without_the_flag(tmp_path):
+    with service(tmp_path, lyric_align=True, aligner_factory=lambda settings: FakeAligner()) as (client, _, _):
+        headers = {"Idempotency-Key": "same-order"}
+        first = client.post("/v1/jobs", json=REQUEST, headers=headers)
+        again = client.post("/v1/jobs", json={**REQUEST, "lyric_timestamps": False}, headers=headers)
+        changed = client.post("/v1/jobs", json={**REQUEST, "lyric_timestamps": True}, headers=headers)
+        assert (first.status_code, again.status_code, changed.status_code) == (202, 200, 409)
+        assert again.json()["id"] == first.json()["id"]
+
+
+@pytest.mark.parametrize("failure", [ValueError("no tokens for '/private/path'"),
+                                     RuntimeError("CUDA out of memory")])
+def test_lyric_alignment_failure_still_delivers_audio(tmp_path, failure):
+    aligner = FakeAligner(failure=failure)
+    with service(tmp_path, lyric_align=True, aligner_factory=lambda settings: aligner) as (client, _, _):
+        job = terminal(client, submit(client, lyric_timestamps=True))
+        assert job["status"] == "succeeded"
+        result = job["result"]
+        assert result["lyric_timings"] is None
+        assert result["lyric_timings_error"] == {
+            "code": "alignment_failed", "message": "Lyrics could not be aligned to the generated audio."}
+        assert "lyric_timings_engine" not in result
+        assert client.get(result["audio_url"]).status_code == 200
+
+
+def test_lyric_aligner_load_failure_keeps_worker_ready(tmp_path):
+    def broken(settings):
+        raise ImportError("uroman is not installed")
+
+    with service(tmp_path, lyric_align=True, aligner_factory=broken) as (client, _, _):
+        job = terminal(client, submit(client, lyric_timestamps=True))
+        assert job["status"] == "succeeded"
+        assert job["result"]["lyric_timings"] is None
+        assert job["result"]["lyric_timings_error"]["code"] == "aligner_unavailable"
+
+
+def test_lyric_timestamps_rejected_when_alignment_disabled(tmp_path):
+    def unexpected(settings):
+        raise AssertionError("Aligner must not load unless YUE2_LYRIC_ALIGN is enabled")
+
+    with service(tmp_path, aligner_factory=unexpected) as (client, _, _):
+        response = client.post("/v1/jobs", json={**REQUEST, "lyric_timestamps": True})
+        assert response.status_code == 400
+        assert terminal(client, submit(client))["status"] == "succeeded"
 
 
 def test_artifact_cleanup_enforces_cap_and_retention_without_deleting_active(tmp_path):
@@ -350,6 +447,8 @@ def test_shutdown_cancels_active_and_leaves_queue_for_restart(tmp_path):
                                     {"stage": "plan", "cot": "off"},
                                     {"stage": "plan", "abc": "X:1"},
                                     {"stage": "unknown"},
+                                    {"stage": "plan", "lyric_timestamps": True},
+                                    {"lyric_timestamps": "true"},
                                     {"unknown": 1}, {"cfg_scale": float("nan")}])
 def test_request_validation(change):
     with pytest.raises(ValidationError):
@@ -427,6 +526,35 @@ def test_worker_batches_vllm_ar_and_serializes_render(tmp_path):
     assert worker._execute_claimed(worker.store.claim_many(2)) is False
     assert pipe.ar_peak == 2 and pipe.render_peak == 1
     assert all(worker.store.get(job["id"])["status"] == "succeeded" for job in submitted)
+
+
+def test_parallel_ar_path_strips_lyric_flag_and_aligns_after_render(tmp_path):
+    class ParallelPipeline:
+        def parallel_ar_eligible(self, request):
+            assert "lyric_timestamps" not in request
+            return True
+
+        def generate_ar(self, *, seed, on_stage, on_token, **kwargs):
+            assert "lyric_timestamps" not in kwargs
+            return seed
+
+        def render_ar(self, seed, **kwargs):
+            def save(output):
+                Path(output, "audio.flac").write_bytes(b"audio-%d" % seed)
+                return {"truncated": {"abc": False, "semantic": False},
+                        "audio_seconds": 1, "sample_rate": 48000, "timing": {}}
+            return SimpleNamespace(abc=None, config={}, save_artifacts=save)
+
+    settings = Settings(api_key=KEY, data_dir=tmp_path, warmup=False, ar_concurrency=2,
+                        vllm_max_num_seqs=2, lyric_align=True)
+    worker = JobWorker(settings, lambda _: None)
+    worker.pipeline, worker.aligner = ParallelPipeline(), FakeAligner()
+    flagged = worker.store.submit({**REQUEST, "seed": 41, "lyric_timestamps": True}, 2)[0]
+    plain = worker.store.submit({**REQUEST, "seed": 42}, 2)[0]
+    assert worker._execute_claimed(worker.store.claim_many(2)) is False
+    assert worker.store.get(flagged["id"])["result"]["lyric_timings_engine"] == "mms"
+    assert "lyric_timings" not in worker.store.get(plain["id"])["result"]
+    assert worker.aligner.calls == [(b"audio-41", REQUEST["lyrics"])]
 
 
 @pytest.mark.parametrize("mode", ["overlap", "admission", "runtime_oom"])
