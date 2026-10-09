@@ -73,6 +73,28 @@ curl -X POST http://127.0.0.1:8000/v1/jobs \
 音频时长；请求该任务的 `/audio` 返回 404。`truncated` 表示乐谱不完整，不应继续用于
 正式生成。`n=2` 时两个候选分别规划乐谱并返回各自的 `score_url`。
 
+需要歌词时间戳时，在完整音频任务里加 `"lyric_timestamps": true`（默认 `false`，`stage=plan`
+不支持）；带 `abc` 的 cover 任务同样适用。音频保存后，worker 把提交的歌词强制对齐到生成的混音上，再标记任务完成，
+所以轮询到 `succeeded` / `truncated` 时结果里已带时间戳；`n=2` 时每个候选各自对齐。
+切行规则与 MV 的 `lyricLines()` 一致：丢掉空行和 `[Verse]` 这类段落标签；整段没有换行时，
+再按句末标点和中日韩词拆分。语言按歌词文字自动判断 zh/ja/ko/en。
+
+```json
+{"lyric_timings":[{"text":"晨光落在窗边","start":10.0,"end":13.78}],"lyric_timings_engine":"mms",
+ "timing":{"lyric_alignment_seconds":1.2}}
+```
+
+对齐先用 MMS CTC（`MahmoudAshraf/mms-300m-1130-forced-aligner`，GPU fp16 常驻）；结果没通过
+合理性检查（时间越界、单行过短或过长、倒序、整首塌缩在开头）时，回退到 CPU 上的
+Whisper（stable-ts）。两者都失败不影响音频：任务照常成功，`lyric_timings` 为 `null`，并带
+`lyric_timings_error.code`：`alignment_failed` 表示对不上，`aligner_unavailable` 表示 worker
+启动时对齐模型加载失败。worker 未开启对齐时，带该参数的提交直接返回 400。
+
+开启方式：在 worker 的 venv 里执行 `uv pip install '.[align]'`，设置 `YUE2_LYRIC_ALIGN=true`。`YUE2_LOCAL_FILES_ONLY=true` 时先把 MMS 模型下载到本地目录，
+再用 `YUE2_LYRIC_ALIGN_MODEL` 指向它；`YUE2_LYRIC_ALIGN_WHISPER_MODEL` 可填 Whisper 模型名
+（默认 `base`）或本地 `.pt` 路径。对齐在声学串行段里执行，期间后续任务的 NAR/VAE 会等待：
+3 分钟的歌在 CPU 上 MMS 约 16 秒、Whisper 回退约 70 秒；GPU 上的 MMS 耗时待 5090 实测。
+
 ```bash
 JOB_ID=替换为返回的id
 curl -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/jobs/$JOB_ID"
@@ -82,7 +104,8 @@ curl -X POST -H "Authorization: Bearer $YUE2_API_KEY" "http://127.0.0.1:8000/v1/
 ```
 
 状态：`queued` → `running` → `succeeded` / `truncated` / `failed` / `cancelled`。
-`stage` 为 loading、planning、semantic、synthesis、decode、saving、finished；
+`stage` 为 loading、planning、semantic、synthesis、decode、saving、aligning（仅
+`lyric_timestamps=true`）、finished；
 `tokens` 为已生成 token 数，不是歌曲完成百分比。时间戳使用 Unix 秒。
 结果含音频/可选乐谱地址、采样率、时长、各阶段耗时、实际配置。
 `truncated` 明确表示达到 token 上限，音频可下载，但不能当作完整成功。
